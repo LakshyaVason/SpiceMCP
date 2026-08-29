@@ -149,6 +149,85 @@ class SimLog(BaseModel):
     raw_text: str = Field(description="The full log text.")
 
 
+class PatchResult(BaseModel):
+    """Result of patch_component_value.
+
+    With `applied` False nothing was written and this is a proposal for review. The
+    `diff` field is the reviewable artifact; the caller is expected to show it before
+    asking for the same call again with apply=True.
+    """
+
+    asc_path: str = Field(description="Schematic the edit targets.")
+    ref: str = Field(description="Component whose value was changed.")
+    old_value: str | None = Field(
+        default=None,
+        description="Value before the edit. None when the component had no value line, "
+        "in which case one was inserted.",
+    )
+    new_value: str = Field(description="Value after the edit.")
+    line_no: int = Field(description="1-indexed line of the SYMATTR Value line affected.")
+    inserted: bool = Field(
+        description="True when the component had no SYMATTR Value line and one was added."
+    )
+    applied: bool = Field(
+        description="True when the file was written. False means this is a preview only "
+        "and the schematic on disk is unchanged."
+    )
+    diff: str = Field(description="Unified diff of the schematic, for the user to review.")
+    before_line: str | None = Field(
+        default=None, description="The original line, verbatim. None when inserting."
+    )
+    after_line: str = Field(description="The replacement line, verbatim.")
+    encoding: str = Field(
+        description="Encoding the file was read and written with. Reported so the caller "
+        "can confirm the schematic's bytes were preserved rather than normalised."
+    )
+    summary: str = Field(description="One-line summary suitable for showing the user.")
+
+
+class ComponentChange(BaseModel):
+    """One component-level difference between two circuits."""
+
+    ref: str = Field(description="Reference designator.")
+    change: str = Field(description="One of: added, removed, value_changed, nodes_changed.")
+    before_value: str | None = Field(default=None, description="Value in the first circuit.")
+    after_value: str | None = Field(default=None, description="Value in the second circuit.")
+    before_nodes: list[str] = Field(
+        default_factory=list, description="Nets in the first circuit."
+    )
+    after_nodes: list[str] = Field(
+        default_factory=list, description="Nets in the second circuit."
+    )
+    detail: str = Field(description="The change in plain English.")
+
+
+class NetlistDiff(BaseModel):
+    """Structured comparison of two circuits: values and connectivity."""
+
+    before_path: str = Field(description="First circuit.")
+    after_path: str = Field(description="Second circuit.")
+    identical: bool = Field(description="True when no component or net differences were found.")
+    component_changes: list[ComponentChange] = Field(
+        description="Per-component differences, values and connectivity."
+    )
+    nets_added: list[str] = Field(description="Nets present only in the second circuit.")
+    nets_removed: list[str] = Field(description="Nets present only in the first circuit.")
+    directives_added: list[str] = Field(description="Directives only in the second circuit.")
+    directives_removed: list[str] = Field(description="Directives only in the first circuit.")
+    text_diff: str = Field(description="Unified diff of the two flattened SPICE netlists.")
+    summary: str = Field(description="One-line summary suitable for showing the user.")
+
+
+class ExportResult(BaseModel):
+    """Result of export_netlist."""
+
+    source_path: str = Field(description="Circuit that was exported.")
+    out_path: str = Field(description="File written.")
+    line_count: int = Field(description="Lines written.")
+    byte_count: int = Field(description="Bytes written.")
+    summary: str = Field(description="One-line summary suitable for showing the user.")
+
+
 class SimulationResult(BaseModel):
     """Result of run_simulation: what happened, plus the parsed log."""
 

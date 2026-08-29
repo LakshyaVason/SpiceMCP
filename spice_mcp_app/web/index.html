@@ -1,0 +1,80 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>SPICE MCP client</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header id="top">
+  <div class="brand">
+    <strong>SPICE MCP client</strong>
+    <span id="model" class="muted">connecting…</span>
+  </div>
+  <div class="counters">
+    <span title="Tokens sent to the model this session">in <b id="tok-in">0</b></span>
+    <span title="Tokens generated this session">out <b id="tok-out">0</b></span>
+    <span title="Turns recorded in the session log">turns <b id="turns">0</b></span>
+    <button id="export" class="ghost" title="Save a copy of the session log">Export log</button>
+  </div>
+</header>
+
+<div id="banner" class="banner hidden"></div>
+
+<main>
+  <aside id="sidebar">
+    <div class="panel-head">
+      <span>Circuit</span>
+      <button id="pick" class="ghost">Open folder…</button>
+    </div>
+    <div id="folder" class="muted small">No folder selected.</div>
+    <ul id="circuits"></ul>
+
+    <div id="checks" class="checks hidden"></div>
+
+    <div class="panel-head" style="margin-top:auto">
+      <span>Session</span>
+    </div>
+    <label class="resolved">
+      <input type="checkbox" id="resolved"> Mark resolved
+    </label>
+    <div id="session-path" class="muted tiny"></div>
+  </aside>
+
+  <section id="chat-pane">
+    <div id="chat">
+      <div class="msg system">
+        <p>Pick a folder, choose a circuit, and describe the problem — or just ask
+        <em>“what’s wrong with this circuit?”</em></p>
+        <p class="muted small">The model reads the netlist through MCP tools. It cannot
+        write to your schematic without your approval.</p>
+      </div>
+    </div>
+
+    <div id="composer">
+      <textarea id="input" rows="3" placeholder="Describe the symptom, or ask what is wrong…"></textarea>
+      <div class="composer-side">
+        <button id="send">Send</button>
+        <button id="resim" class="ghost" title="Re-run the simulation on the selected circuit">Re-simulate</button>
+      </div>
+    </div>
+  </section>
+</main>
+
+<div id="diff-modal" class="modal hidden">
+  <div class="modal-box">
+    <h2>Review proposed change</h2>
+    <p id="diff-summary" class="muted"></p>
+    <pre id="diff-body" class="diff"></pre>
+    <p class="muted tiny" id="diff-note"></p>
+    <div class="modal-actions">
+      <button id="diff-reject" class="ghost">Reject</button>
+      <button id="diff-apply">Apply to schematic</button>
+    </div>
+  </div>
+</div>
+
+<script src="app.js"></script>
+</body>
+</html>

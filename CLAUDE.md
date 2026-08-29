@@ -31,8 +31,14 @@ the LTspice GUI, the sim is re-run to confirm, and every turn's token usage is l
 5. **Byte fidelity on `.asc` files.** `RCLP.asc` is bare-LF/no-BOM; `RCLP.net` is CRLF.
    `.gitattributes` exempts `*.asc/*.asy/*.net/*.cir` from `text=auto` so git never rewrites
    schematic bytes. Patching must preserve encoding and line endings exactly.
-6. **Preserve the session-log schema as specified** (see Step 5 below). The external cost
-   comparison depends on it. No analysis UI in the app — it records, it does not analyse.
+6. **Preserve the session-log schema as specified** (see "Session log" below). The external
+   cost comparison depends on it. No analysis UI in the app — it records, it does not analyse.
+7. **Nothing touches the user's schematic before they approve it.** `patch_component_value`
+   defaults to a preview, but the model can pass `apply=True` itself, so the real gate is
+   `Api._tool_executor`, which refuses any apply not registered by `Api.apply_patch` (the
+   UI-only path). Approvals are keyed on `(resolved path, ref, new value)` and are
+   single-use. `tests/test_llm.py` is the regression test — it asserts the refused call
+   never reaches the server.
 
 ## Decisions already made with the user — don't relitigate
 
@@ -79,13 +85,44 @@ confirmed empirically; please don't "fix" the code back toward the wrong version
 - `spicelib` caveats: `AscEditor` wants designators *without* the SPICE prefix (`U1`),
   `SpiceEditor` *with* (`XU1`); library-sourced components raise on write.
 
+### TAMU proxy facts (verified 2026-08-29 via `scripts\probe_tool_calling.py`)
+
+- **`"stream": false` is mandatory, not the default.** Omit it and the proxy answers with
+  `Content-Type: text/event-stream` — `response.json()` raises `JSONDecodeError` on line 1 —
+  **and the streamed form carries no `usage` block at all.** Silently null token counts would
+  invalidate the whole cost comparison, so `TamuClient.complete` always sends it.
+- **No `/v1` in the path.** `…/openai/v1/chat/completions` returns 403 "Direct API passthrough
+  is disabled." The correct URL is `{base_url}/chat/completions`.
+- **Tool calling works fully** on `protected.Claude Opus 4.8`: `tools` is accepted, the model
+  emits OpenAI-shaped `tool_calls`, and a `role:"tool"` + `tool_call_id` reply closes the
+  round trip. The plan's prompted-JSON fallback is **not needed** — don't build it.
+- The model id contains a space (`protected.Claude Opus 4.8`). That is real, not a typo.
+- **`SYMATTR Value2` is a trap.** `RCLP.asc`'s `V1` has both `Value` and `Value2` (`AC 0.7
+  3000`). A `startswith("Value")` match patches the wrong line, so `asc.py` tokenises the
+  attribute name.
+
+### Known limitation
+
+**Automated verification that the pywebview window *renders* is blocked.** `evaluate_js` from
+a worker thread deadlocks (WebView2 requires UI-thread access), and a push-based probe — a
+temp copy of `web/` calling back into a `ProbeApi` subclass — produced no output either.
+The window does open and the bridge does work (JS calling `start()` reaches Python). In place
+of a render test, `tests/test_app_wiring.py` cross-references UI↔Python statically: every
+`pywebview.api.X` resolves to a real `Api` method, every id `app.js` looks up exists in
+`index.html`. Visual confirmation needs the user's eyes. The WebView2 noise at launch
+(`AllowExternalDrop`, `DefaultBackgroundColor`, `Failed to unregister class
+Chrome_WidgetWin_0`) is pywebview probing optional properties — harmless.
+
 ## Commands
 
 ```bat
 .venv\Scripts\activate
-python -m pytest                        REM 103 tests, ~22s
+python -m pytest                        REM 159 tests, ~29s
+python -m spice_mcp_app                 REM the desktop app; --folder fixtures --debug
 python -m spice_mcp_server              REM stdio server; sits waiting for a client
 python scripts\list_tamu_models.py      REM needs TAMU_API_KEY
+python scripts\probe_tool_calling.py    REM 3-stage TAMU check; costs a few tokens
+python scripts\app_smoke.py             REM headless end-to-end, no window; costs tokens
 ```
 
 Prefix Python invocations with `PYTHONIOENCODING=utf-8` — LTspice output contains `Ω`, `µ`
@@ -93,12 +130,36 @@ and `°`, which crash a cp1252 console.
 
 `.mcp.json` registers the server so it can be driven from Claude Code directly.
 
-## State: Steps 0–4 complete
+## State: Steps 0–8 implemented; 159 tests pass
 
-`spice_mcp_server/` exposes **four working tools**, all verified over a real MCP stdio
-handshake: `read_netlist`, `check_netlist_static`, `run_simulation`, `read_sim_log`.
-Modules: `models.py` (pydantic schemas), `netlist.py` (parser + ExpressPCB detection),
-`checks.py` (nine static checks), `logparse.py`, `ltspice.py` (staged invocation).
+**Server half — `spice_mcp_server/`, seven tools**, all verified over a real MCP stdio
+handshake. It still knows nothing about LLMs.
+
+| tool | notes |
+| --- | --- |
+| `read_netlist` | structured components/nets/directives; ExpressPCB detection |
+| `check_netlist_static` | nine checks, no simulation |
+| `run_simulation` | staged into `%TEMP%`; `succeeded` from log text only |
+| `read_sim_log` | re-read a `.log` from a previous run or the GUI |
+| `patch_component_value` | **preview by default**; `apply=True` writes byte-faithfully |
+| `diff_netlist` | before/after by ref; value change vs. rewire reported separately |
+| `export_netlist` | SPICE netlist to a chosen path, CRLF, refuses to overwrite |
+
+Modules: `models.py` (pydantic schemas), `netlist.py`, `checks.py`, `logparse.py`,
+`ltspice.py` (staged invocation), `asc.py` (byte-preserving patcher), `diff.py`.
+
+**App half — `spice_mcp_app/`.** The only half that knows what an LLM is.
+`config.py` (env/`.env`, redacted logging), `session.py` (the spec'd log, atomic write per
+turn), `llm.py` (TAMU client, MCP→OpenAI schema translation, bounded agent loop),
+`mcp_client.py` (stdio client holding one server subprocess open), `api.py` (JS bridge +
+**the approval gate**), `web/` (single-window UI), `__main__.py`.
+
+### Session log
+`./sessions/<uuid>.json`, flushed after every turn: `session_id`, `started_at`, `model`,
+`circuit_file`, `turns[]` (each `role`, `text`, optional `tool_calls`, `input_tokens`,
+`output_tokens`), `total_input_tokens`, `total_output_tokens`, `resolved`. `Turn.from_usage`
+is the **one** place `prompt_tokens`/`completion_tokens` are mapped to the spec's names, and
+it warns when an assistant turn arrives without usage.
 
 ### Testing philosophy — keep this
 `tests/test_checks.py` asserts the **exact set** of checks each fixture produces. Equality
@@ -109,6 +170,10 @@ misfiring on the known-good circuit must fail the suite loudly.
 Log-parser test samples are **real captured LTspice output**, never invented. The messages
 are inconsistent enough that plausible-looking fabricated samples would test the wrong thing.
 
+The suite is offline and free: `tests/test_llm.py` drives the agent loop with a `FakeClient`
+returning canned OpenAI-shaped responses. Live-model checks live in `scripts/`, not in
+`pytest`, so running the tests never costs tokens or depends on the proxy being up.
+
 ### Fixtures pull in different directions on purpose
 `no_dc_path.asc` is caught by the static check but **simulates fine** (exit 0, solves `.op`
 "by inspection"). `source_conflict.asc` is the mirror: **statically clean**, genuinely fails
@@ -116,36 +181,24 @@ to simulate. `wrong_value_lowpass.asc` passes both and is out of spec by 10× �
 *reasoning* catches it. `RCLP.asc` also simulates "successfully" despite `R1` dangling and
 `Vin` driving nothing. Neither pass subsumes the other; that's the argument for two stages.
 
-## Remaining work
+## Acceptance bar — met, except two items needing the user
 
-**Blocked on the user:** they must run `scripts\list_tamu_models.py` and report the model
-list before the first live LLM call. Everything else can proceed.
+`scripts\app_smoke.py` drives the real `Api` headlessly through nine stages on a temp copy of
+`wrong_value_lowpass.asc` and passed end to end: diagnosis → **approval-gate probe** (the
+model is asked to write unilaterally; the gate refuses and the file stays byte-identical) →
+approval → byte fidelity → re-simulate → model confirmation → session-log audit
+(16 turns, 41 996 in / 1 572 out, schema keys exactly as specified, no null counts, totals
+matching).
 
-- **Step 5 — app shell.** pywebview window, folder picker, chat panel. One hardcoded TAMU
-  call to prove token logging works before the agent loop exists. Session log per debug
-  session to `./sessions/<uuid>.json`, plus an export button:
-  `session_id`, `started_at`, `model`, `circuit_file`, `turns[]` (each `role`, `text`,
-  optional `tool_calls`, `input_tokens`, `output_tokens`), `total_input_tokens`,
-  `total_output_tokens`, `resolved`. TAMU returns OpenAI-shaped
-  `usage.prompt_tokens`/`completion_tokens` — **map** these to `input_tokens`/`output_tokens`
-  so the specified schema is preserved.
-- **Step 6 — MCP client + agent loop.** `spice_mcp_app/mcp_client.py` (stdio) and `llm.py`
-  (MCP→OpenAI tool-schema translation, loop on `tool_calls`, `role:"tool"` results, record
-  usage per turn). **Probe TAMU tool-calling support with a one-tool smoke test first** —
-  it is unverified and is the project's main open risk. If the model rejects `tools`, the
-  fallback is a prompted JSON tool protocol.
-- **Step 7 — write-back + diff UI.** `patch_component_value(asc_path, ref, new_value)`:
-  find the `SYMATTR Value` line belonging to the matching `SYMATTR InstName <ref>` and
-  rewrite **only** that line. Hand-rolled, not `AscEditor.save_netlist`, which reformats.
-  Plus `diff_netlist` and `export_netlist`. Nothing touches disk before user approval.
-- **Step 8 — end-to-end** on `wrong_value_lowpass.asc`: chat diagnosis → accepted fix →
-  file written → re-simulate → confirm fixed.
-
-### Acceptance bar still to meet
-- Byte-fidelity test on `patch_component_value`: only the intended line changes, encoding
-  and line endings unchanged, and the patched file **still opens in the LTspice GUI**.
-- `sessions/*.json` inspected for complete, non-null token counts on every turn. The
-  external cost comparison depends entirely on that file being complete.
+- ✅ Byte fidelity on `patch_component_value` — only the intended line changes, encoding and
+  line endings unchanged, and the patched file survives an LTspice `-netlist` round trip and
+  re-simulates (`tests/test_asc.py`, incl. `@needs_ltspice`).
+- ✅ Token counts complete and non-null on every turn (`tests/test_session.py` + the smoke
+  script's stage 9 audit).
+- ⏳ **Needs the user:** open a patched `.asc` in the LTspice **GUI**. Only the `-netlist`/`-b`
+  proxy is automated, and the bar names the GUI specifically.
+- ⏳ **Needs the user:** look at the app window (`python -m spice_mcp_app --folder fixtures`).
+  See "Known limitation" above for why this can't be automated here.
 
 ## Useful symbol geometry (read from LTspice's `lib.zip`)
 

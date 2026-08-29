@@ -27,10 +27,21 @@ from mcp.server import MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 
 from . import __version__
+from .asc import AscError
+from .asc import patch_component_value as _patch_component_value
 from .checks import run_static_checks
+from .diff import diff_netlists
 from .logparse import read_sim_log as _read_sim_log
 from .ltspice import LTSpiceError, run_batch
-from .models import Netlist, SimLog, SimulationResult, StaticCheckResult
+from .models import (
+    ExportResult,
+    Netlist,
+    NetlistDiff,
+    PatchResult,
+    SimLog,
+    SimulationResult,
+    StaticCheckResult,
+)
 from .netlist import NetlistFormatError, load_netlist
 
 log = logging.getLogger(__name__)
@@ -238,3 +249,134 @@ def read_sim_log(path: str, include_raw_text: bool = False) -> SimLog:
         parsed = parsed.model_copy(update={"raw_text": ""})
     log.info("read_sim_log %s -> %s", path, parsed.summary)
     return parsed
+
+
+@mcp.tool()
+def patch_component_value(
+    asc_path: str, ref: str, new_value: str, apply: bool = False
+) -> PatchResult:
+    """Change one component's value in a .asc schematic, preserving every other byte.
+
+    **Defaults to a preview.** With apply=False nothing is written: you get back the
+    unified diff so the user can review the change. Propose the fix that way first,
+    show them the diff, and only call again with apply=True once they have agreed. Do
+    not set apply=True on your own initiative.
+
+    The edit rewrites only the `SYMATTR Value` line belonging to the matching
+    `SYMATTR InstName`, keeping the file's original encoding and line endings exactly.
+    That is what lets the patched schematic still open in the LTspice GUI, and what
+    keeps the diff reviewable.
+
+    Only component values can be changed here. Rewiring needs a different fix - report
+    it in prose instead.
+
+    Args:
+        asc_path: Path to the .asc schematic. Not a .net or .cir: the schematic is the
+            source of truth and the only form that stays editable in the GUI.
+        ref: Reference designator, e.g. 'C1'. Case-insensitive.
+        new_value: The replacement value, e.g. '100n'. Remember that in SPICE 'M' means
+            milli, not mega - use 'MEG' for mega.
+        apply: Write the file. Leave False to preview.
+    """
+    resolved = _resolve(asc_path)
+    if resolved.suffix.lower() != ".asc":
+        raise ToolError(
+            f"{resolved.name} is not a .asc schematic. Values can only be patched in "
+            "the schematic, because that is the file that stays usable in the LTspice "
+            "GUI. Point me at the .asc instead."
+        )
+
+    try:
+        outcome = _patch_component_value(resolved, ref, new_value, apply=apply)
+    except AscError as exc:
+        # Genuinely diagnostic - it lists the components that do exist.
+        raise ToolError(str(exc)) from exc
+
+    if outcome.applied:
+        summary = (
+            f"{ref} set to {outcome.new_value} in {resolved.name} "
+            f"(line {outcome.line_no}, was {outcome.old_value!r}). File written."
+        )
+    else:
+        summary = (
+            f"Proposed: {ref} {outcome.old_value!r} -> {outcome.new_value!r} at line "
+            f"{outcome.line_no}. Nothing written yet - show the diff and get approval, "
+            "then call again with apply=True."
+        )
+
+    log.info("patch_component_value %s %s -> applied=%s", asc_path, ref, outcome.applied)
+    return PatchResult(
+        asc_path=str(resolved),
+        ref=outcome.ref,
+        old_value=outcome.old_value,
+        new_value=outcome.new_value,
+        line_no=outcome.line_no,
+        inserted=outcome.inserted,
+        applied=outcome.applied,
+        diff=outcome.diff,
+        before_line=outcome.before_line,
+        after_line=outcome.after_line,
+        encoding=outcome.encoding,
+        summary=summary,
+    )
+
+
+@mcp.tool()
+def diff_netlist(before_path: str, after_path: str) -> NetlistDiff:
+    """Compare two circuits by component and connectivity.
+
+    Components are matched by reference designator, so a value change is reported
+    separately from a rewiring - the two mean different things. Use this to confirm a
+    fix changed what you intended and nothing else, for instance after patching a value
+    or against a backup copy of the schematic.
+
+    Args:
+        before_path: The original .asc, .net or .cir.
+        after_path: The circuit to compare against it.
+    """
+    result = diff_netlists(_load(before_path), _load(after_path))
+    log.info("diff_netlist %s vs %s -> %s", before_path, after_path, result.summary)
+    return result
+
+
+@mcp.tool()
+def export_netlist(path: str, out_path: str) -> ExportResult:
+    """Write a circuit's flattened SPICE netlist to a file.
+
+    For fixes that cannot be expressed as a value change - rewiring, adding a component -
+    where the user wants an editable SPICE deck. Note that a .net is not a schematic:
+    it has no coordinates, so it does not open in the LTspice schematic editor. Prefer
+    patch_component_value when the fix is only a value.
+
+    Args:
+        path: Circuit to export.
+        out_path: File to write. Must not already exist, so nothing is overwritten.
+    """
+    netlist = _load(path)
+
+    target = Path(out_path.strip()).expanduser()
+    if not target.is_absolute():
+        target = (Path.cwd() / target).resolve()
+    if target.exists():
+        raise ToolError(
+            f"{target} already exists. Choose a new path - this tool will not overwrite "
+            "a file."
+        )
+    if not target.parent.is_dir():
+        raise ToolError(f"The folder {target.parent} does not exist.")
+
+    text = netlist.raw_text
+    if not text.endswith("\n"):
+        text += "\n"
+    # CRLF because that is what LTspice itself writes into a .net.
+    data = text.encode("utf-8").replace(b"\r\n", b"\n").replace(b"\n", b"\r\n")
+    target.write_bytes(data)
+
+    log.info("export_netlist %s -> %s (%d bytes)", path, target, len(data))
+    return ExportResult(
+        source_path=netlist.source_path,
+        out_path=str(target),
+        line_count=text.count("\n"),
+        byte_count=len(data),
+        summary=f"Wrote {len(data)} bytes of SPICE netlist to {target.name}.",
+    )

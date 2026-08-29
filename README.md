@@ -58,6 +58,31 @@ This script deliberately lives outside the app's dependency tree — it needs on
 `requests` (`pip install -r scripts\requirements.txt`) so it can be run without the full
 app environment. Put your chosen model id in `SPICE_MCP_MODEL` in `.env`.
 
+Model ids from this proxy can contain spaces (`protected.Claude Opus 4.8`). That is normal.
+
+The app needs the model to support **tool calling**. To check one before relying on it:
+
+```bat
+python scripts\probe_tool_calling.py
+```
+
+Three stages — a plain completion with usage, a `tool_calls` emission, and a `role:"tool"`
+round trip. It costs a few tokens. `protected.Claude Opus 4.8` passes all three.
+
+## Running the app
+
+```bat
+python -m spice_mcp_app --folder fixtures
+```
+
+Open a folder, pick a circuit, and describe the symptom. The model has the seven tools
+below and will read, check and simulate on its own. When it proposes a value change you get
+a before/after diff with **Apply** and **Reject**; applying writes the `.asc` and
+immediately re-simulates, because a fix that was never verified is not a finished fix.
+
+`--debug` turns up logging. The header shows running token totals; **Export log** saves the
+session JSON wherever you want it.
+
 ## Running the MCP server
 
 Normally the desktop app spawns it. To run it standalone (it speaks MCP over stdio, so it
@@ -73,6 +98,12 @@ the protocol wire and must stay clean.
 The repo ships a `.mcp.json`, so the server can also be driven straight from Claude Code
 against the fixtures without the app existing yet.
 
+Nothing about the server is Claude Code specific — it is a plain MCP stdio server and any
+MCP host can spawn it. `.mcp.json` is just one host's registration file. Its `command` is
+relative to the repo root, so a host that launches from somewhere else needs either an
+absolute path to `.venv\Scripts\python.exe` or the repo set as the working directory. The
+real constraints are the server's own: Windows, and LTspice for anything touching a `.asc`.
+
 ## Tools
 
 | Tool | What it does |
@@ -81,6 +112,9 @@ against the fixtures without the app existing yet.
 | `check_netlist_static(path)` | Findings with no simulation: missing ground, floating pins, isolated sections, no DC path to ground, duplicate refs, missing/malformed values, the `M`-means-milli trap, missing analysis directive. |
 | `run_simulation(path, timeout_s)` | Runs `-b` in a scratch dir, kills the process tree on timeout, returns the parsed log. |
 | `read_sim_log(path)` | Parses a `.log`: singular/over-defined matrices, undefined models (with netlist line number), convergence and timestep failures, floating nodes, missing `.include`/`.lib`, `.measure` results. |
+| `patch_component_value(asc_path, ref, new_value, apply)` | Changes one component's value in a `.asc`. **Previews by default** — returns the diff without writing. |
+| `diff_netlist(before_path, after_path)` | Compares two circuits by reference designator: value changes, rewires, added/removed parts, net and directive changes. |
+| `export_netlist(path, out_path)` | Writes a real SPICE netlist to a path you choose. Refuses to overwrite. |
 
 ### Never trust the exit code
 
@@ -120,14 +154,32 @@ the input into a scratch directory under `%TEMP%\spice_mcp_work\` first, and all
 artifacts land there. `tests/test_ltspice.py` pins this down — it is a regression test for
 a real incident, not a hypothetical.
 
+## The model cannot edit your schematic on its own
+
+Exactly one tool writes to your files, and the approval for it is registered by the
+**Apply** button, not by the model. If the model calls `patch_component_value` with
+`apply=true` off its own bat, the app refuses the call and tells it to show you a diff
+instead. Approvals are single-use and specific to one file, one reference designator and one
+value — approving `C1 → 100n` does not authorise `R1`, or a second write of the same value.
+`tests/test_llm.py` asserts the refused call never reaches the server; the end-to-end script
+also asks the model to bypass the gate and checks the file comes back byte-identical.
+
+When a write does happen it is surgical: the one `SYMATTR Value` line belonging to that
+component is rewritten, reusing the file's own indentation and line terminator. Encoding,
+line endings and every other byte are preserved, so the schematic still opens in the LTspice
+GUI — which is the whole point of patching the `.asc` rather than a netlist.
+
 ## Tests
 
 ```bat
 python -m pytest
 ```
 
-Parser and static-check tests run without LTspice installed; schematic tests skip
-automatically if the executable is not found.
+159 tests, ~30s. Parser and static-check tests run without LTspice installed; schematic
+tests skip automatically if the executable is not found. Nothing in the suite calls the
+network, so running it costs no tokens — the live-model checks are the two scripts,
+`probe_tool_calling.py` and `app_smoke.py` (a headless nine-stage end-to-end run against
+a temp copy of `wrong_value_lowpass.asc`).
 
 The fixture matrix in `tests/test_checks.py` asserts the **exact** set of checks each
 circuit produces. Equality rather than membership is deliberate: it makes the suite a
@@ -173,7 +225,15 @@ spice_mcp_server/   MCP server. Knows nothing about LLMs.
   checks.py         static checks
   logparse.py       .log parsing — where the real diagnosis usually lives
   ltspice.py        exe discovery, staged -netlist / -b invocation, timeouts
+  asc.py            byte-preserving .asc value patching
+  diff.py           before/after circuit comparison
 spice_mcp_app/      desktop UI + LLM client + MCP client
+  config.py         key/model/base-url resolution; redacts the key for logs
+  session.py        the token log; atomic write after every turn
+  llm.py            TAMU client, MCP→OpenAI schema translation, agent loop
+  mcp_client.py     stdio client; holds one server subprocess open
+  api.py            the JS bridge — and the approval gate
+  web/              index.html, style.css, app.js
 scripts/            standalone utilities, own requirements.txt
 fixtures/           deliberately broken circuits
 sessions/           per-session token logs (git-ignored)
@@ -189,6 +249,24 @@ OpenAI-shaped `prompt_tokens`/`completion_tokens`; these are mapped to
 `input_tokens`/`output_tokens` on the way in so the log schema stays stable. Cost
 comparison against the old screenshot workflow is done **externally** — the app only
 records, it does not analyse.
+
+```json
+{
+  "session_id": "…", "started_at": "…", "model": "…", "circuit_file": "…\\RCLP.asc",
+  "turns": [{"role": "assistant", "text": "…", "tool_calls": [],
+             "input_tokens": 4211, "output_tokens": 96}],
+  "total_input_tokens": 41996, "total_output_tokens": 1572, "resolved": true
+}
+```
+
+The file is rewritten atomically after **every** turn, so a crash mid-session still leaves a
+complete log. `tool_calls` is present only on turns that made them. `resolved` is the
+**Mark resolved** button — it is how you tell, later, which sessions actually ended in a fix.
+
+One wrinkle worth knowing if you point this at another OpenAI-compatible proxy: requests
+must send `"stream": false` explicitly. The TAMU proxy otherwise replies with an event
+stream **and omits the `usage` block entirely**, which would leave every token count null
+without anything visibly failing.
 
 ## Notes for future work
 
