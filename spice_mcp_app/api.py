@@ -14,9 +14,12 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import threading
 from pathlib import Path
 from typing import Any
+
+from spice_mcp_server.ltspice import ltspice_is_running
 
 from .config import Config, ConfigError, load_config
 from .llm import (
@@ -62,11 +65,27 @@ class Api:
         self._approved: set[tuple[str, str, str]] = set()
         self._lock = threading.Lock()  # one agent turn at a time
         self.window: Any = None
-        # Set by __main__ when --folder was passed; the UI asks for it on load.
+        # Set by __main__ when --folder/--file was passed; the UI asks for these on load.
         self.initial_folder: str | None = None
+        self.initial_circuit: str | None = None
+        # A non-fatal problem from before the window existed, e.g. the Explorer launcher
+        # failing to start LTspice. Shown in the banner rather than lost to a dead console.
+        self.startup_note: str | None = None
+        # True when the launcher opened `initial_circuit` in the GUI itself moments ago.
+        self.opened_in_ltspice = False
+        self._warned_about_ltspice = False
 
     def get_initial_folder(self) -> dict[str, Any]:
-        return _ok(folder=self.initial_folder)
+        """Everything the UI needs on load, in one round trip.
+
+        Extending this payload rather than adding a method keeps the bridge surface - and
+        the contract asserted in tests/test_app_wiring.py - unchanged.
+        """
+        return _ok(
+            folder=self.initial_folder,
+            circuit=self.initial_circuit,
+            note=self.startup_note,
+        )
 
     # --- startup ---------------------------------------------------------------------
 
@@ -171,7 +190,46 @@ class Api:
         self._history.append({"role": "user", "content": note})
         self._session.add_turn(Turn(role="user", text=note))
 
-        return _ok(circuit_file=str(target), name=target.name, checks=checks)
+        return _ok(
+            circuit_file=str(target),
+            name=target.name,
+            checks=checks,
+            warning=self._ltspice_open_warning(target),
+        )
+
+    def _ltspice_open_warning(self, target: Path) -> str | None:
+        """Warn once that what we read from disk may not be what is on screen.
+
+        Everything here reads the .asc from the filesystem, so unsaved GUI edits are
+        invisible to it and every answer would be about a stale circuit. Once per session,
+        not once per selection: a warning that repeats on every click is a warning people
+        stop reading.
+
+        Suppressed entirely on the Explorer path's first look, where the launcher opened the
+        GUI on this exact file microseconds ago - disk and screen are identical, so warning
+        there would fire on every single launch at the moment it is least true. The project's
+        own testing philosophy is the argument: a check that cries wolf trains people to
+        ignore it. Re-select the file later and the warning is live again.
+        """
+        if self.opened_in_ltspice and self._same_file(target, self.initial_circuit):
+            self.opened_in_ltspice = False
+            return None
+        if self._warned_about_ltspice or not ltspice_is_running():
+            return None
+        self._warned_about_ltspice = True
+        return (
+            "LTspice is open. Everything here is read from the file on disk, so save in "
+            "LTspice (Ctrl+S) before asking - unsaved edits are invisible to this client."
+        )
+
+    @staticmethod
+    def _same_file(left: Path, right: str | None) -> bool:
+        """Compare two paths the way Windows does: case-insensitively."""
+        if not right:
+            return False
+        return os.path.normcase(os.path.abspath(left)) == os.path.normcase(
+            os.path.abspath(right)
+        )
 
     # --- chat ------------------------------------------------------------------------
 
@@ -310,7 +368,19 @@ class Api:
         self._history.append({"role": "user", "content": note})
         self._session.add_turn(Turn(role="user", text=note))
 
-        return _ok(patch=payload, summary=payload.get("summary"))
+        # The write is never blocked on LTspice being open - the user asked for the fix and
+        # the file is theirs. But LTspice holds its own copy of the schematic and will
+        # write it back over ours on save, so silently succeeding here would hand them a
+        # fix that quietly disappears later.
+        warning = None
+        if ltspice_is_running():
+            warning = (
+                f"LTspice is running and will not notice this edit. If {resolved.name} is "
+                f"open there, use File ▸ Revert to reload it - saving from LTspice "
+                f"without reverting will overwrite this fix."
+            )
+
+        return _ok(patch=payload, summary=payload.get("summary"), warning=warning)
 
     def resimulate(self) -> dict[str, Any]:
         """Re-run the simulation on the session's circuit to confirm a fix."""

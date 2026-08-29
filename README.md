@@ -83,6 +83,59 @@ immediately re-simulates, because a fix that was never verified is not a finishe
 `--debug` turns up logging. The header shows running token totals; **Export log** saves the
 session JSON wherever you want it.
 
+`--file <path>` opens a single circuit: it selects it and runs the static checks on load, and
+its folder populates the sidebar. That is what the Explorer entry below uses.
+
+## Launch from Explorer
+
+Registering a right-click entry removes the three manual steps between "something looks wrong"
+and "ask about it":
+
+```bat
+python scripts\install_context_menu.py              REM install
+python scripts\install_context_menu.py --status      REM what is actually registered
+python scripts\install_context_menu.py --uninstall   REM remove
+```
+
+Then right-click any `.asc` and choose **Debug with SPICE MCP**. It opens the schematic in
+LTspice *and* the client, with that circuit already selected and its static checks already on
+screen.
+
+**On Windows 11 this lives in the legacy menu** — right-click, then **Show more options** (or
+Shift+right-click). The new compact menu is populated only by packaged (MSIX) apps implementing
+the `IExplorerCommand` COM interface; there is no registry setting that promotes a classic verb
+into it.
+
+Details worth knowing:
+
+- **Per-user, no administrator rights, reversible.** Everything goes under
+  `HKCU\Software\Classes\SystemFileAssociations\.asc\shell\`, which *adds* a verb. It creates
+  no ProgID, never touches `HKCU\Software\Classes\.asc`, and stays clear of `shell\open`, so
+  LTspice's own association and what double-clicking a schematic does are unchanged. The verb
+  is marked `NeverDefault` so it can never be promoted to the double-click action.
+- **The absolute paths are baked into the registry**, because the registry cannot give a
+  command a working directory. Move or rename the repo, or rebuild `.venv`, and the entry
+  stops working until you re-run the installer. `--status` diagnoses exactly that.
+- It runs `pythonw.exe`, so no console window flashes. The cost is that a failure before the
+  window exists has nowhere to print, so the launcher shows a message box for fatal errors and
+  writes `launch.log` at the repo root.
+- The apps come up together **when you start from the schematic**. Opening LTspice on its own
+  from the Start menu will not summon the client — nothing watches for it.
+
+## Editing in LTspice at the same time
+
+The circuit is bound once, at launch. Nothing polls LTspice, and the client only ever reads the
+`.asc` **from disk**, so:
+
+- **Before asking**, save in LTspice (Ctrl+S) — unsaved GUI edits are invisible here. The app
+  says so once per session when it notices LTspice running.
+- **After applying a fix**, LTspice will not notice the external edit. It holds its own copy and
+  will write it back over yours if you save from the GUI. Use **File ▸ Revert** to reload the
+  patched file. The app warns about this in the conversation whenever LTspice is running.
+
+The write itself is never blocked on this — you asked for the fix and the file is yours. The
+warning exists so a fix cannot quietly disappear later.
+
 ## Running the MCP server
 
 Normally the desktop app spawns it. To run it standalone (it speaks MCP over stdio, so it
@@ -175,7 +228,7 @@ GUI — which is the whole point of patching the `.asc` rather than a netlist.
 python -m pytest
 ```
 
-159 tests, ~30s. Parser and static-check tests run without LTspice installed; schematic
+209 tests, ~25s. Parser and static-check tests run without LTspice installed; schematic
 tests skip automatically if the executable is not found. Nothing in the suite calls the
 network, so running it costs no tokens — the live-model checks are the two scripts,
 `probe_tool_calling.py` and `app_smoke.py` (a headless nine-stage end-to-end run against
@@ -233,8 +286,11 @@ spice_mcp_app/      desktop UI + LLM client + MCP client
   llm.py            TAMU client, MCP→OpenAI schema translation, agent loop
   mcp_client.py     stdio client; holds one server subprocess open
   api.py            the JS bridge — and the approval gate
+  launch.py         the Explorer entry point: opens LTspice, then the window
   web/              index.html, style.css, app.js
+spice_mcp_launch.py repo-root shim the registry command points at
 scripts/            standalone utilities, own requirements.txt
+  install_context_menu.py   adds/removes the right-click verb (HKCU, no admin)
 fixtures/           deliberately broken circuits
 sessions/           per-session token logs (git-ignored)
 ```

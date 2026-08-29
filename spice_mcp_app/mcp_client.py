@@ -21,6 +21,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import sys
 import threading
 from concurrent.futures import Future
@@ -37,6 +38,10 @@ log = logging.getLogger(__name__)
 # tokens. Truncate defensively; the model can ask for a narrower view.
 MAX_RESULT_CHARS = 60_000
 
+# Withheld from the server subprocess. These are the app half's business only, and the key
+# in particular has no reason to exist in a process that knows nothing about LLMs.
+_LLM_ONLY_ENV = frozenset({"TAMU_API_KEY", "SPICE_MCP_MODEL", "SPICE_MCP_BASE_URL"})
+
 
 class MCPClientError(RuntimeError):
     """The server could not be started or a call failed at the transport level."""
@@ -48,12 +53,29 @@ def _server_params() -> StdioServerParameters:
     sys.executable rather than a hardcoded `.venv\\Scripts\\python.exe` so the app and
     the server can never end up on different interpreters, and cwd is pinned to the
     repo root so relative circuit paths resolve the way the user expects.
+
+    The environment is *extended*, not replaced. Passing a bare two-key dict silently
+    dropped LTSPICE_EXE - and PATH, and SPICE_MCP_WORKDIR - so a user who overrode their
+    LTspice location in `.env` (which `.env.example` says works) got the default search
+    inside the server anyway.
+
+    Extended minus the LLM variables, though. The server must never learn what an LLM is,
+    and that is not only an architectural line: forwarding TAMU_API_KEY would hand the key
+    to a process with no use for it, widening its exposure for nothing.
+
+    Ordering note: LTSPICE_EXE only reaches os.environ once `load_dotenv` has run inside
+    `load_config()`. `Api.__init__` does that before `start()` gets here, so the app path is
+    fine; a bare `SpiceMCP()` with no prior `load_config()` would not be.
     """
+    env = {k: v for k, v in os.environ.items() if k not in _LLM_ONLY_ENV}
+    env["SPICE_MCP_LOG_LEVEL"] = os.environ.get("SPICE_MCP_LOG_LEVEL", "INFO")
+    # The server's stdout is the MCP wire and its stderr carries LTspice's Ω/µ/°.
+    env["PYTHONIOENCODING"] = "utf-8"
     return StdioServerParameters(
         command=sys.executable,
         args=["-m", "spice_mcp_server"],
         cwd=str(REPO_ROOT),
-        env={"SPICE_MCP_LOG_LEVEL": "INFO", "PYTHONIOENCODING": "utf-8"},
+        env=env,
     )
 
 

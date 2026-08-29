@@ -84,7 +84,18 @@ window.addEventListener("pywebviewready", async () => {
   $("session-path").textContent = started.session_path;
 
   const initial = await window.pywebview.api.get_initial_folder();
-  if (initial.ok && initial.folder) loadFolder(await window.pywebview.api.list_folder(initial.folder));
+  if (!initial.ok) return;
+
+  if (initial.folder) {
+    loadFolder(await window.pywebview.api.list_folder(initial.folder));
+    // Launched on one circuit: select it now so the static checks are already on screen.
+    if (initial.circuit) await selectCircuit(initial.circuit, findCircuitRow(initial.circuit));
+  }
+
+  // Last, because loadFolder and selectCircuit both clear the banner on success. A problem
+  // from before the window existed has nowhere else to go - launched from Explorer via
+  // pythonw there is no console it could have been printed to.
+  if (initial.note) banner(initial.note);
 });
 
 /* --- circuit list ------------------------------------------------------------ */
@@ -109,6 +120,9 @@ function loadFolder(result) {
 
   for (const circuit of result.circuits) {
     const li = document.createElement("li");
+    // The key findCircuitRow matches on. It cannot use li.title, which holds the
+    // ExpressPCB warning instead of the path for a shadowed entry.
+    li.dataset.path = circuit.path;
     if (circuit.shadowed) li.classList.add("shadowed");
     li.innerHTML =
       `<span>${escapeHtml(circuit.name)}</span>` +
@@ -121,9 +135,21 @@ function loadFolder(result) {
   }
 }
 
+/* Find the sidebar row for a path. Windows paths differ in case harmlessly, and walking
+   the list avoids escaping backslashes into a CSS selector. */
+function findCircuitRow(path) {
+  const wanted = String(path).toLowerCase();
+  for (const li of document.querySelectorAll("#circuits li")) {
+    if ((li.dataset.path || "").toLowerCase() === wanted) return li;
+  }
+  return null;
+}
+
 async function selectCircuit(path, li) {
   document.querySelectorAll("#circuits li").forEach((n) => n.classList.remove("active"));
-  li.classList.add("active");
+  // Optional: a circuit opened from the command line may have no row, e.g. a .asy or a
+  // file outside the listed folder. Selecting it must still work, just unhighlighted.
+  if (li) li.classList.add("active");
 
   const result = await window.pywebview.api.select_circuit(path);
   if (!result.ok) { banner(result.error); return; }
@@ -133,6 +159,8 @@ async function selectCircuit(path, li) {
   $("resim").disabled = busy;
   renderChecks(result.checks);
   bubble("system", `<p class="muted small">Selected <code>${escapeHtml(result.name)}</code> — ${escapeHtml(result.checks.summary || "")}</p>`);
+  // Once per session: we read the .asc from disk, so unsaved GUI edits are invisible here.
+  if (result.warning) bubble("system", `<p class="sev-warning small">${escapeHtml(result.warning)}</p>`);
 }
 
 function renderChecks(checks) {
@@ -256,6 +284,9 @@ $("diff-apply").addEventListener("click", async () => {
 
   if (!result.ok) { bubble("error", escapeHtml(result.error)); return; }
   bubble("system", `<p class="sev-ok small">${escapeHtml(result.summary)}</p>`);
+  // The file is written either way; this says so plainly rather than letting the fix
+  // vanish the next time the user saves from the LTspice GUI.
+  if (result.warning) bubble("system", `<p class="sev-warning small">${escapeHtml(result.warning)}</p>`);
 
   // Re-check and re-simulate straight away: an applied fix that was never verified is
   // not a finished fix.

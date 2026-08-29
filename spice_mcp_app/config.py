@@ -75,8 +75,21 @@ def load_config(*, require_key: bool = True) -> Config:
         model=(os.environ.get("SPICE_MCP_MODEL") or "").strip() or DEFAULT_MODEL,
         base_url=(os.environ.get("SPICE_MCP_BASE_URL") or "").strip()
         or DEFAULT_BASE_URL,
-        sessions_dir=Path(
+        sessions_dir=_resolve_sessions_dir(
             (os.environ.get("SPICE_MCP_SESSIONS_DIR") or "").strip()
-            or SESSIONS_DIR
         ),
     )
+
+
+def _resolve_sessions_dir(raw: str) -> Path:
+    """Anchor a relative SPICE_MCP_SESSIONS_DIR to the repo, not the cwd.
+
+    The Explorer right-click launcher starts us with the cwd set to whichever folder the
+    schematic lives in, so resolving a relative path against the cwd would scatter session
+    logs into the user's source directory - the one thing this project promises never to
+    write to. Absolute values are honoured as given.
+    """
+    if not raw:
+        return SESSIONS_DIR
+    candidate = Path(raw).expanduser()
+    return candidate if candidate.is_absolute() else REPO_ROOT / candidate

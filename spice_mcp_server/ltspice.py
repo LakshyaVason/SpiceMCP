@@ -130,6 +130,31 @@ def find_ltspice_exe() -> Path:
     )
 
 
+def ltspice_is_running() -> bool:
+    """True if an LTspice GUI process is alive right now.
+
+    Used only to warn the user: LTspice reads a .asc once, at open, and writes its own
+    in-memory copy back on save. It will not notice that we patched the file underneath
+    it, so a save from the GUI silently reverts the fix. Knowing whether the GUI is up
+    is what lets the app say so instead of leaving the user to discover it.
+
+    Deliberately not an MCP tool - the model has no use for it, and an eighth tool
+    schema would be paid for in every request. Best-effort by design: any psutil
+    problem returns False, because a missing warning is better than a false one.
+    """
+    names = {"ltspice.exe", "xviix64.exe", "scad3.exe"}
+    try:
+        import psutil
+
+        for proc in psutil.process_iter(["name"]):
+            name = (proc.info.get("name") or "").lower()
+            if name in names:
+                return True
+    except Exception:
+        log.debug("could not enumerate processes to check for LTspice", exc_info=True)
+    return False
+
+
 def ltspice_version() -> str:
     """Return the LTspice version string, for diagnostics."""
     exe = find_ltspice_exe()

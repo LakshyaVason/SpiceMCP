@@ -21,5 +21,10 @@ requests>=2.32
 # Loads TAMU_API_KEY from a git-ignored .env.
 python-dotenv>=1.0
 
+# Process handling: killing a hung LTspice batch run, and detecting a running LTspice GUI
+# so an applied patch can warn that the GUI will overwrite it. It has always arrived as a
+# spicelib transitive; declared here because shipped features now depend on it directly.
+psutil>=7
+
 # Tests.
 pytest>=8

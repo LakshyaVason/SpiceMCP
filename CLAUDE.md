@@ -85,6 +85,42 @@ confirmed empirically; please don't "fix" the code back toward the wrong version
 - `spicelib` caveats: `AscEditor` wants designators *without* the SPICE prefix (`U1`),
   `SpiceEditor` *with* (`XU1`); library-sourced components raise on write.
 
+### Explorer-launch facts, verified 2026-08-29
+
+- **Under `pythonw.exe` with no console — which is what Explorer gives us — `sys.stdout`,
+  `sys.stderr` and `sys.stdin` are ALL `None`.** `logging.StreamHandler(sys.stderr)` then
+  builds a handler whose `.stream` is `None` and **silently discards every record**. Both
+  `launch.py` and `spice_mcp_app/__main__.py` therefore guard with
+  `if sys.stderr is not None else logging.NullHandler()`, and `launch.py` adds a
+  `FileHandler` on `launch.log` as the primary sink. Don't "simplify" these back to
+  `basicConfig(stream=...)`.
+- **The MCP stdio handshake works fine under a console-less `pythonw` parent**, with
+  `pythonw.exe` as the server interpreter too: probed to `handshake OK, 7 tools` plus a real
+  `check_netlist_static` (which shells out to `LTspice -netlist`) returning findings. This
+  was the feature's biggest risk — `sys.stdin`/`stdout` being `None` in the *parent* does not
+  affect the pipes the SDK creates for the child. Without this the whole thing would have
+  worked from a terminal and failed silently from Explorer.
+- **A `SystemFileAssociations` verb lands in the Win11 *legacy* menu** ("Show more options"
+  / Shift+right-click), not the compact one. The compact menu takes only packaged MSIX apps
+  implementing `IExplorerCommand`; no registry setting promotes a classic verb into it.
+  Documented as an expectation to confirm at install time — not verified on this machine yet.
+- `HKCU\Software\Classes\.asc` is owned by the ProgID `Analog Devices Inc..LTspice_1`, and
+  `SystemFileAssociations\.asc` did not exist in HKCU or HKCR. Hence the installer creates a
+  clean subtree. Hanging the verb off LTspice's ProgID was the alternative and is rejected:
+  that name is version-suffixed and would break when LTspice re-registers itself.
+- `psutil.process_iter(['name'])` enumerates all 441 processes here **unelevated**, so
+  `ltspice_is_running()` needs no `ctypes`/`CreateToolhelp32Snapshot` fallback.
+
+### The app is allowed to import from the server
+
+`spice_mcp_app.api` imports `ltspice_is_running` from `spice_mcp_server.ltspice` directly,
+not over MCP. The invariant is one-directional: the **server** must never learn what an LLM
+is. App→server is already the real dependency direction (the app spawns the server), and
+`tests/conftest.py` imports the same module. `ltspice_is_running` is deliberately **not** an
+MCP tool — it is a UX detail the model never needs, and an eighth tool schema would be paid
+for in every request. `tests/test_write_conflict.py` asserts the tool set is still exactly
+seven.
+
 ### TAMU proxy facts (verified 2026-08-29 via `scripts\probe_tool_calling.py`)
 
 - **`"stream": false` is mandatory, not the default.** Omit it and the proxy answers with
@@ -117,9 +153,12 @@ Chrome_WidgetWin_0`) is pywebview probing optional properties — harmless.
 
 ```bat
 .venv\Scripts\activate
-python -m pytest                        REM 159 tests, ~29s
+python -m pytest                        REM 209 tests, ~25s
 python -m spice_mcp_app                 REM the desktop app; --folder fixtures --debug
+python -m spice_mcp_app --file fixtures\wrong_value_lowpass.asc   REM one circuit, pre-checked
+python -m spice_mcp_app.launch fixtures\wrong_value_lowpass.asc --no-ltspice
 python -m spice_mcp_server              REM stdio server; sits waiting for a client
+python scripts\install_context_menu.py  REM right-click verb; --status / --uninstall
 python scripts\list_tamu_models.py      REM needs TAMU_API_KEY
 python scripts\probe_tool_calling.py    REM 3-stage TAMU check; costs a few tokens
 python scripts\app_smoke.py             REM headless end-to-end, no window; costs tokens
@@ -130,7 +169,7 @@ and `°`, which crash a cp1252 console.
 
 `.mcp.json` registers the server so it can be driven from Claude Code directly.
 
-## State: Steps 0–8 implemented; 159 tests pass
+## State: Steps 0–8 plus the Explorer launcher; 209 tests pass
 
 **Server half — `spice_mcp_server/`, seven tools**, all verified over a real MCP stdio
 handshake. It still knows nothing about LLMs.
@@ -152,7 +191,33 @@ Modules: `models.py` (pydantic schemas), `netlist.py`, `checks.py`, `logparse.py
 `config.py` (env/`.env`, redacted logging), `session.py` (the spec'd log, atomic write per
 turn), `llm.py` (TAMU client, MCP→OpenAI schema translation, bounded agent loop),
 `mcp_client.py` (stdio client holding one server subprocess open), `api.py` (JS bridge +
-**the approval gate**), `web/` (single-window UI), `__main__.py`.
+**the approval gate**), `web/` (single-window UI), `__main__.py`, `launch.py` (the Explorer
+entry point). Plus `spice_mcp_launch.py` at the repo root — a one-line shim so the registry
+command can be an absolute script path, since the registry cannot set a working directory.
+
+### Launching from Explorer
+
+Right-click a `.asc` → "Debug with SPICE MCP" opens LTspice **and** the client with that
+circuit selected and its static checks already run. Three decisions the user made, which are
+requirements and not preferences:
+
+1. **The trigger is the right-click verb.** Not a combined shortcut, not a background
+   watcher, and not the client opening LTspice. So the two apps come up together *only* when
+   you start from the schematic — opening LTspice from the Start menu summons nothing.
+2. **The circuit is bound once, at launch.** Do not add polling of LTspice window titles.
+3. **Applying a fix while LTspice runs warns, then writes** — never blocks. The user asked
+   for the fix and the file is theirs; the warning (File ▸ Revert) exists so the fix cannot
+   quietly disappear when they next save from the GUI.
+
+Two corrections this feature forced, both hard-constraint-2 adjacent, because the launcher
+starts with the cwd set to the user's circuit folder:
+
+- `config.py` now anchors a **relative** `SPICE_MCP_SESSIONS_DIR` to `REPO_ROOT`. Resolved
+  against the cwd it would have scattered session logs into the user's source directory.
+- `mcp_client.py` passed `env=` as a **replacement** dict, so `LTSPICE_EXE` never reached the
+  server despite `.env.example` documenting that it would. It now merges over `os.environ`
+  minus `_LLM_ONLY_ENV` — the key in particular has no business in a process that knows
+  nothing about LLMs. `tests/test_config.py` pins both.
 
 ### Session log
 `./sessions/<uuid>.json`, flushed after every turn: `session_id`, `started_at`, `model`,
@@ -199,6 +264,25 @@ matching).
   proxy is automated, and the bar names the GUI specifically.
 - ⏳ **Needs the user:** look at the app window (`python -m spice_mcp_app --folder fixtures`).
   See "Known limitation" above for why this can't be automated here.
+
+**Both are closed by one pass of the Explorer-launcher walkthrough**, which is why that
+feature was the natural next move rather than a detour:
+
+1. `python scripts\install_context_menu.py` — should print four keys.
+2. Right-click `fixtures\wrong_value_lowpass.asc` → **Show more options** → "Debug with SPICE
+   MCP". (If it appears in the compact menu directly, that is better than expected — fix the
+   README's Win11 caveat.)
+3. LTspice opens the schematic; the client window opens; the sidebar lists `fixtures`;
+   `wrong_value_lowpass.asc` is highlighted with its static checks already rendered, no
+   clicking. ← closes the app-window item.
+4. Ask what is wrong, let it propose the `C1` fix, press **Apply** → the amber File ▸ Revert
+   warning appears and the auto re-simulation still runs.
+5. In LTspice: **File ▸ Revert** → `C1` shows the new value in the GUI. ← closes the GUI item.
+6. `python scripts\install_context_menu.py --uninstall` — the entry is gone.
+
+Automated up to that point: 209 tests, plus a headless launcher run verified to reach window
+creation with `get_initial_folder()` returning the resolved folder and circuit, cwd back at
+the repo root, and nothing written beside the fixture.
 
 ## Useful symbol geometry (read from LTspice's `lib.zip`)
 
