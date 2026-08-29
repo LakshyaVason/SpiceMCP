@@ -1,2 +1,17 @@
 # Auto detect text files and perform LF normalization
 * text=auto
+
+# LTspice files must keep their bytes intact. LTspice writes schematics with its own
+# line-ending and encoding conventions, and patch_component_value guarantees a
+# byte-for-byte round trip except for the single line it edits. Letting git rewrite
+# line endings on commit/checkout would break that guarantee.
+*.asc -text
+*.asy -text
+*.net -text
+*.cir -text
+*.log -text
+
+# Binary simulation output.
+*.raw binary
+*.fra binary
+*.op.raw binary

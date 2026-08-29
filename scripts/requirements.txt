@@ -1,0 +1,13 @@
+# Standalone deps for the sibling benchmark/utility scripts.
+#
+# These are intentionally kept out of the app's dependency tree: the token-usage
+# comparison runs externally, so these scripts only need an HTTP client.
+#
+#   python -m venv scripts/.venv
+#   scripts\.venv\Scripts\activate
+#   pip install -r scripts/requirements.txt
+#
+# (The project .venv at the repo root already satisfies these, so activating that
+# instead works fine for one-off runs.)
+
+requests>=2.32

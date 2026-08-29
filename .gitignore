@@ -179,3 +179,18 @@ cython_debug/
 #  refer to https://docs.cursor.com/context/ignore-files
 .cursorignore
 .cursorindexingignore
+
+# --- SPICE MCP client ---
+
+# Debug session logs (token usage records). Exported deliberately, never committed.
+sessions/
+
+# LTspice simulation artifacts. Regenerated on every run.
+*.raw
+*.op.raw
+*.fra
+*.log
+
+# Scratch dir the MCP server generates netlists into, so it never clobbers
+# the user's own .net files.
+.spicework/

@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "spice-mcp": {
+      "command": ".venv\\Scripts\\python.exe",
+      "args": ["-m", "spice_mcp_server"],
+      "env": {
+        "SPICE_MCP_LOG_LEVEL": "INFO"
+      }
+    }
+  }
+}

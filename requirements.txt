@@ -1,0 +1,25 @@
+# SPICE MCP client - runtime dependencies
+#
+# Install into the project venv:
+#   .venv\Scripts\activate
+#   pip install -r requirements.txt
+
+# MCP server + stdio client. NOTE: v2.x is a rewrite of the v1 API.
+# v1 used FastMCP; v2 uses mcp.server.MCPServer. Do not downgrade below 2.1
+# without rewriting spice_mcp_server/server.py.
+mcp>=2.1,<3
+
+# LTspice .asc/.netlist parsing, .raw waveform reading, .log parsing.
+spicelib>=1.6.3,<2
+
+# Desktop window for the app (uses the OS webview; no Node/Electron toolchain).
+pywebview>=6.2
+
+# TAMU AI Chat is OpenAI-compatible and called over plain HTTP.
+requests>=2.32
+
+# Loads TAMU_API_KEY from a git-ignored .env.
+python-dotenv>=1.0
+
+# Tests.
+pytest>=8
