@@ -86,7 +86,11 @@ def main(
         background_color="#11131a",
         text_select=True,
     )
-    api.window = window
+    # Through the setter, and onto a private attribute. Assigning the Window to a public
+    # attribute of `api` makes pywebview's bridge builder recurse into the native WinForms
+    # form and never finish, which leaves the window open but completely dead. See
+    # Api._attach_window.
+    api._attach_window(window)
     api.startup_note = startup_note
 
     # Both are read by the UI on load, so --folder behaves as if it had been picked and

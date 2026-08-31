@@ -145,15 +145,51 @@ temp copy of `web/` calling back into a `ProbeApi` subclass — produced no outp
 The window does open and the bridge does work (JS calling `start()` reaches Python). In place
 of a render test, `tests/test_app_wiring.py` cross-references UI↔Python statically: every
 `pywebview.api.X` resolves to a real `Api` method, every id `app.js` looks up exists in
-`index.html`. Visual confirmation needs the user's eyes. The WebView2 noise at launch
-(`AllowExternalDrop`, `DefaultBackgroundColor`, `Failed to unregister class
-Chrome_WidgetWin_0`) is pywebview probing optional properties — harmless.
+`index.html`. Visual confirmation needs the user's eyes.
+
+A previous version of this section called the WebView2 noise at launch (`AllowExternalDrop`,
+`DefaultBackgroundColor`, `Failed to unregister class Chrome_WidgetWin_0`) "pywebview probing
+optional properties — harmless." **That was wrong, and it cost a day.** It was the bridge walk
+described below chewing through the native object graph, and it hung every launch. A clean
+launch now prints none of it — if you see that noise again, something is being walked that
+should not be.
+
+### The pywebview bridge walk — verified 2026-08-30
+
+**pywebview 6.2.1 builds `window.pywebview.api` by recursively walking every *public*
+attribute of the `js_api` object** (`webview/util.py:180-211`, in `inject_pywebview`). Public
+methods become JS functions; public *non-callables that have a `__module__`* get descended
+into. Names starting with `_` are skipped, and objects can opt out with
+`_serializable = False`.
+
+- **`Api` must keep every public attribute a `str`, `bool` or `None`.** Anything richer goes
+  behind an underscore. `tests/test_app_wiring.py` enforces this by replicating pywebview's
+  own recursion predicate over `dir(Api())` and asserting the walked set is **empty** — so a
+  new rich public attribute fails the suite instead of failing at launch, in a webview, with
+  no traceback anywhere Python can see.
+- **The window reference is `Api._window`, set via `Api._attach_window()`.** It was
+  `api.window`, and that single missing underscore hung the app on every launch. pywebview
+  guards its own `DOM`, `EventContainer` and `state` with `_serializable = False`, but
+  **`Window.native` is unguarded** (`webview/window.py:182`) — under the winforms backend
+  that is the .NET `Form`, so the walk went
+  `Form.AccessibilityObject` → `.Bounds` (a `System.Drawing.Rectangle`) → `.Empty` (a static
+  `Rectangle`) → `.Empty` → … to the recursion limit. pythonnet returns a fresh wrapper on
+  every `getattr`, so pywebview's `id(obj)` dedup in `exposed_objects` never fires.
+- **Why that is fatal rather than noisy:** the walk sits *between* injecting the pywebview
+  scaffolding and running `finish.js`, and `finish.js` is what dispatches `pywebviewready`
+  (`webview/js/finish.js:9`). `web/app.js` boots the whole UI from that event. So the window
+  opened, painted nothing useful, never called `start()`, and had to be killed from Task
+  Manager. **A window that opens and does nothing is this bug; look at the bridge, not at the
+  MCP server.**
+- `web/app.js` now sets a 30 s watchdog that banners "The Python bridge did not initialise"
+  if `pywebviewready` never arrives. It only helps when the bridge alone is broken — a walk
+  that blocks the UI thread outright leaves nothing able to paint.
 
 ## Commands
 
 ```bat
 .venv\Scripts\activate
-python -m pytest                        REM 209 tests, ~25s
+python -m pytest                        REM 211 tests, ~29s
 python -m spice_mcp_app                 REM the desktop app; --folder fixtures --debug
 python -m spice_mcp_app --file fixtures\wrong_value_lowpass.asc   REM one circuit, pre-checked
 python -m spice_mcp_app.launch fixtures\wrong_value_lowpass.asc --no-ltspice
@@ -169,7 +205,7 @@ and `°`, which crash a cp1252 console.
 
 `.mcp.json` registers the server so it can be driven from Claude Code directly.
 
-## State: Steps 0–8 plus the Explorer launcher; 209 tests pass
+## State: Steps 0–8 plus the Explorer launcher; 211 tests pass
 
 **Server half — `spice_mcp_server/`, seven tools**, all verified over a real MCP stdio
 handshake. It still knows nothing about LLMs.
@@ -266,7 +302,13 @@ matching).
   See "Known limitation" above for why this can't be automated here.
 
 **Both are closed by one pass of the Explorer-launcher walkthrough**, which is why that
-feature was the natural next move rather than a detour:
+feature was the natural next move rather than a detour. Note that the walkthrough was
+**not runnable at all** until the bridge-walk hang was fixed (see "The pywebview bridge
+walk") — every launch produced a dead window. The launcher itself was never the problem.
+Steps 1–3 below have since been reached automatically: launching on
+`fixtures\wrong_value_lowpass.asc` reaches `MCP server ready with 7 tools` and a
+`check_netlist_static` on the preselected circuit with no clicking, so what remains is the
+part that genuinely needs eyes.
 
 1. `python scripts\install_context_menu.py` — should print four keys.
 2. Right-click `fixtures\wrong_value_lowpass.asc` → **Show more options** → "Debug with SPICE
@@ -280,7 +322,7 @@ feature was the natural next move rather than a detour:
 5. In LTspice: **File ▸ Revert** → `C1` shows the new value in the GUI. ← closes the GUI item.
 6. `python scripts\install_context_menu.py --uninstall` — the entry is gone.
 
-Automated up to that point: 209 tests, plus a headless launcher run verified to reach window
+Automated up to that point: 211 tests, plus a headless launcher run verified to reach window
 creation with `get_initial_folder()` returning the resolved folder and circuit, cwd back at
 the repo root, and nothing written beside the fixture.
 

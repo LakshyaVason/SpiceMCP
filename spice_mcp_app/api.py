@@ -64,7 +64,15 @@ class Api:
         self._history: list[dict[str, Any]] = []
         self._approved: set[tuple[str, str, str]] = set()
         self._lock = threading.Lock()  # one agent turn at a time
-        self.window: Any = None
+        # The leading underscore is load-bearing, not style. pywebview builds the JS bridge
+        # by recursively walking every *public* attribute of this object
+        # (webview/util.py:180-211) and it skips names starting with "_". Public, this held a
+        # webview.Window, whose `native` is the .NET WinForms Form - unguarded, unlike
+        # pywebview's own DOM/EventContainer/state, which set `_serializable = False`. The
+        # walk then descended Form.AccessibilityObject.Bounds.Empty.Empty... forever and
+        # never returned, so `finish.js` never fired `pywebviewready` and the window opened
+        # dead. See _attach_window.
+        self._window: Any = None
         # Set by __main__ when --folder/--file was passed; the UI asks for these on load.
         self.initial_folder: str | None = None
         self.initial_circuit: str | None = None
@@ -74,6 +82,20 @@ class Api:
         # True when the launcher opened `initial_circuit` in the GUI itself moments ago.
         self.opened_in_ltspice = False
         self._warned_about_ltspice = False
+
+    def _attach_window(self, window: Any) -> None:
+        """Hand this bridge the pywebview Window, for the two file dialogs.
+
+        Called by `__main__` once the window exists - it cannot be a constructor argument
+        because `create_window` needs the `js_api` object first.
+
+        Underscore-named on both sides on purpose. pywebview walks the public attributes of
+        this class to build the JS API, recursing into any non-callable that has a
+        `__module__`, and a `Window` leads it straight into the native WinForms/WebView2
+        object graph, where it never comes back. Keep every *public* attribute of `Api` a
+        str, bool or None; anything richer belongs behind an underscore.
+        """
+        self._window = window
 
     def get_initial_folder(self) -> dict[str, Any]:
         """Everything the UI needs on load, in one round trip.
@@ -133,10 +155,10 @@ class Api:
         """Open the OS folder picker and list the circuits inside."""
         import webview
 
-        if self.window is None:
+        if self._window is None:
             return _err("No window is attached.")
 
-        chosen = self.window.create_file_dialog(webview.FOLDER_DIALOG)
+        chosen = self._window.create_file_dialog(webview.FOLDER_DIALOG)
         if not chosen:
             return _ok(cancelled=True)
 
@@ -442,10 +464,10 @@ class Api:
             return _err("The session is not started.")
 
         destination: str | None = None
-        if self.window is not None:
+        if self._window is not None:
             import webview
 
-            chosen = self.window.create_file_dialog(
+            chosen = self._window.create_file_dialog(
                 webview.SAVE_DIALOG,
                 save_filename=f"spice-mcp-session-{self._session.session_id[:8]}.json",
                 file_types=("JSON (*.json)",),
