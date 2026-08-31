@@ -98,6 +98,87 @@ def test_api_exposes_everything_the_ui_needs():
         assert callable(getattr(Api, name, None)), f"Api.{name} is missing"
 
 
+# --- what pywebview does to the bridge object ------------------------------------------
+
+
+def _pywebview_would_recurse_into(attr: object) -> bool:
+    """pywebview's own recursion condition, copied from webview/util.py:203-205.
+
+    Kept verbatim rather than paraphrased so the test tracks what pywebview actually does.
+    """
+    import inspect
+
+    return inspect.isclass(attr) or (
+        isinstance(attr, object) and not callable(attr) and hasattr(attr, "__module__")
+    )
+
+
+class StubWindow:
+    """Stands in for a pywebview Window, for both tests below.
+
+    A user-defined class, deliberately: `_pywebview_would_recurse_into` turns on
+    `hasattr(attr, "__module__")`, and a bare `object()` does *not* have one - so a stub of
+    `object()` would sail through the guard below and make it prove nothing. A real Window
+    has a `__module__`, and so does this.
+    """
+
+    def __init__(self) -> None:
+        self.calls: list[object] = []
+
+    def create_file_dialog(self, *args, **kwargs):
+        self.calls.append((args, kwargs))
+        return None  # cancelled, which is all the dialog tests need
+
+
+def test_no_public_api_attribute_is_recursed_into_by_pywebview():
+    """Every public attribute of Api must be a scalar pywebview will not walk into.
+
+    pywebview builds window.pywebview.api by walking `dir(js_api)` recursively
+    (webview/util.py:180-211): public names that are methods become JS functions, and public
+    names that are non-callable objects with a `__module__` get *descended into*. Its own
+    internals opt out with `_serializable = False` - DOM, EventContainer, state - but
+    `Window.native` does not, and under the winforms backend that is the .NET Form. Holding
+    the Window on a public attribute sent the walk down
+    Form.AccessibilityObject.Bounds.Empty.Empty... until the recursion limit, and it never
+    came back. Since the walk sits *between* injecting the pywebview scaffolding and running
+    finish.js, `pywebviewready` was never dispatched, `pywebview.api` never existed, and the
+    app opened as a dead window that had to be killed from Task Manager.
+
+    Asserted as an exact empty set, in this suite's usual style: any *new* rich public
+    attribute fails here rather than at launch, in a webview, with no traceback.
+    """
+    api = Api()
+    api._attach_window(StubWindow())
+    assert _pywebview_would_recurse_into(StubWindow()), (
+        "the stub is not something pywebview would walk into, so this test proves nothing"
+    )
+
+    walked = sorted(
+        name
+        for name in dir(api)
+        if not name.startswith("_") and _pywebview_would_recurse_into(getattr(api, name))
+    )
+    assert walked == [], (
+        f"pywebview will recurse into Api.{walked} when building the JS bridge; "
+        f"rename to _-prefixed or store a plain str/bool/None"
+    )
+
+
+def test_the_file_dialogs_still_find_the_window():
+    """The rename above has to reach every reader, or both file dialogs quietly break.
+
+    They are the only two users of the window reference, and neither is exercised by the
+    headless smoke script - a half-finished rename shows up only as "No window is attached."
+    on a real click.
+    """
+    api = Api()
+    stub = StubWindow()
+    api._attach_window(stub)
+
+    assert api.pick_folder() == {"ok": True, "cancelled": True}
+    assert stub.calls, "pick_folder never reached the window"
+
+
 # --- the single-circuit launch path ----------------------------------------------------
 #
 # All of this is only reachable from Explorer, so nothing else in the suite would notice if

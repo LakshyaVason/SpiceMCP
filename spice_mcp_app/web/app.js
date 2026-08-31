@@ -72,7 +72,22 @@ function setBusy(state, label) {
 
 /* --- startup ----------------------------------------------------------------- */
 
+/* Everything below hangs off "pywebviewready". pywebview fires that only after it has
+   finished walking the js_api object to build window.pywebview.api, so a fault in that walk
+   leaves this page loaded and inert with nothing on screen to say why. Say it.
+
+   Not a cure for every hang: if the walk blocks the UI thread rather than just failing, this
+   banner will not get a chance to paint either. It covers the bridge-only case. */
+const bridgeWatchdog = setTimeout(() => {
+  banner(
+    "The Python bridge did not initialise, so nothing here is connected. " +
+    "See launch.log in the repo root."
+  );
+  $("model").textContent = "not connected";
+}, 30000);
+
 window.addEventListener("pywebviewready", async () => {
+  clearTimeout(bridgeWatchdog);
   const started = await window.pywebview.api.start();
   if (!started.ok) {
     $("model").textContent = "not connected";
