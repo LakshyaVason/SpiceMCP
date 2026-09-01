@@ -15,9 +15,9 @@ from dotenv import load_dotenv
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
-# The TAMU AI Chat proxy is OpenAI-compatible, so /models and /chat/completions hang
-# off this base exactly as they would on api.openai.com/v1.
-DEFAULT_BASE_URL = "https://chat-api.tamu.ai/openai"
+# The TAMU Gateway exposes the OpenAI-compatible surface under /v1 on the gateway host.
+# For example: https://gateway.api.tamu.ai/v1/chat/completions
+DEFAULT_BASE_URL = "https://gateway.api.tamu.ai"
 
 # Verified present on the proxy on 2026-08-29 via scripts/list_tamu_models.py. The
 # space in the id is real - do not "clean it up".
@@ -39,7 +39,7 @@ class Config:
 
     @property
     def chat_completions_url(self) -> str:
-        return f"{self.base_url}/chat/completions"
+        return f"{self.base_url.rstrip('/')}/v1/chat/completions"
 
     def redacted(self) -> dict[str, str]:
         """A form of this config that is safe to log or show in the UI."""
@@ -51,6 +51,17 @@ class Config:
             "base_url": self.base_url,
             "sessions_dir": str(self.sessions_dir),
         }
+
+
+def _normalize_base_url(raw: str) -> str:
+    """Accept either the gateway host or an older path variant and normalize to host."""
+    value = (raw or "").strip().rstrip("/")
+    if not value:
+        return DEFAULT_BASE_URL
+    for suffix in ("/v1", "/openai", "/api"):
+        if value.lower().endswith(suffix):
+            value = value[: -len(suffix)]
+    return value or DEFAULT_BASE_URL
 
 
 def load_config(*, require_key: bool = True) -> Config:
@@ -73,8 +84,7 @@ def load_config(*, require_key: bool = True) -> Config:
     return Config(
         api_key=api_key,
         model=(os.environ.get("SPICE_MCP_MODEL") or "").strip() or DEFAULT_MODEL,
-        base_url=(os.environ.get("SPICE_MCP_BASE_URL") or "").strip()
-        or DEFAULT_BASE_URL,
+        base_url=_normalize_base_url(os.environ.get("SPICE_MCP_BASE_URL")),
         sessions_dir=_resolve_sessions_dir(
             (os.environ.get("SPICE_MCP_SESSIONS_DIR") or "").strip()
         ),

@@ -20,7 +20,18 @@ from pathlib import Path
 import requests
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-BASE_URL = "https://chat-api.tamu.ai/openai"
+DEFAULT_BASE_URL = "https://gateway.api.tamu.ai"
+
+
+def resolve_base_url() -> str:
+    """Use the same global override as the app runtime when available."""
+    value = (os.environ.get("SPICE_MCP_BASE_URL") or "").strip().rstrip("/")
+    if not value:
+        return DEFAULT_BASE_URL
+    for suffix in ("/v1", "/openai", "/api"):
+        if value.lower().endswith(suffix):
+            value = value[: -len(suffix)]
+    return value or DEFAULT_BASE_URL
 
 
 def load_api_key() -> str:
@@ -49,7 +60,8 @@ def load_api_key() -> str:
 
 
 def call_models_api(api_key: str) -> dict:
-    url = f"{BASE_URL}/models"
+    base_url = resolve_base_url()
+    url = f"{base_url}/v1/models"
     headers = {
         "accept": "application/json",
         "Authorization": f"Bearer {api_key}",
@@ -78,8 +90,9 @@ def main() -> int:
     # The response is OpenAI-shaped: {"object": "list", "data": [{"id": ...}, ...]}
     models = result.get("data")
     if isinstance(models, list):
+        base_url = resolve_base_url()
         ids = sorted(str(m.get("id", "?")) for m in models)
-        print(f"{len(ids)} model(s) available on {BASE_URL}:\n")
+        print(f"{len(ids)} model(s) available on {base_url}:\n")
         for model_id in ids:
             print(f"  {model_id}")
         print(

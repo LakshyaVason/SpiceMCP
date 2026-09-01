@@ -65,3 +65,19 @@ def test_the_server_runs_from_the_repo_root(monkeypatch, tmp_path):
     """So a relative circuit path never resolves into somewhere unexpected."""
     monkeypatch.chdir(tmp_path)
     assert Path(_server_params().cwd) == REPO_ROOT
+
+
+def test_the_model_listing_uses_the_shared_base_url_override(monkeypatch):
+    """The helper script should honor the same global override as the app."""
+    monkeypatch.setenv("SPICE_MCP_BASE_URL", "https://example.invalid/openai")
+
+    import importlib.util
+    from pathlib import Path
+
+    module_path = Path(__file__).resolve().parent.parent / "scripts" / "list_tamu_models.py"
+    spec = importlib.util.spec_from_file_location("list_tamu_models", module_path)
+    module = importlib.util.module_from_spec(spec)
+    assert spec is not None and spec.loader is not None
+    spec.loader.exec_module(module)
+
+    assert module.resolve_base_url() == "https://example.invalid"

@@ -6,8 +6,8 @@ The proxy is OpenAI-compatible, with two deviations found by probing it (see
   * **`"stream": false` must be sent explicitly.** Omit it and the proxy replies with
     `text/event-stream` *and* drops the `usage` block entirely. Since per-turn token
     counts are the reason the session log exists, every request forces it off.
-  * `/openai/v1/chat/completions` returns 403 ("Direct API passthrough is disabled").
-    The correct path has no `/v1`.
+  * The TAMU gateway exposes the OpenAI-compatible API under `/v1` on the gateway host.
+    The correct path is `{base_url}/v1/chat/completions`.
 
 Tool calling itself works fully on `protected.Claude Opus 4.8`: `tool_calls` come back
 with parseable JSON arguments, `role: "tool"` results are accepted, and `usage` is

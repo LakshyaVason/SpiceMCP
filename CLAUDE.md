@@ -45,7 +45,7 @@ the LTspice GUI, the sim is re-run to confirm, and every turn's token usage is l
 - Name: "SPICE MCP client". Repo stays `SpiceMCP`.
 - Python-only desktop app (pywebview/PySide). No Electron, no Node toolchain.
 - `spicelib` is an accepted dependency; no from-scratch parser.
-- LLM is the **TAMU AI Chat** proxy (`https://chat-api.tamu.ai/openai`), OpenAI-compatible —
+- LLM is the **TAMU AI Gateway** (`https://gateway.api.tamu.ai`), OpenAI-compatible —
   not Anthropic directly.
 - Two-process MCP split over local stdio. The server **must never learn what an LLM is** —
   that's what makes it reusable for the later EDA-tool work.
@@ -127,8 +127,8 @@ seven.
   `Content-Type: text/event-stream` — `response.json()` raises `JSONDecodeError` on line 1 —
   **and the streamed form carries no `usage` block at all.** Silently null token counts would
   invalidate the whole cost comparison, so `TamuClient.complete` always sends it.
-- **No `/v1` in the path.** `…/openai/v1/chat/completions` returns 403 "Direct API passthrough
-  is disabled." The correct URL is `{base_url}/chat/completions`.
+- **Use the gateway host with `/v1` in the path.** The correct URL is
+  `{base_url}/v1/chat/completions` on `https://gateway.api.tamu.ai`.
 - **Tool calling works fully** on `protected.Claude Opus 4.8`: `tools` is accepted, the model
   emits OpenAI-shaped `tool_calls`, and a `role:"tool"` + `tool_call_id` reply closes the
   round trip. The plan's prompted-JSON fallback is **not needed** — don't build it.
