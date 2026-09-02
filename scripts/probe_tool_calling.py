@@ -1,27 +1,45 @@
-"""Probe whether a TAMU AI Chat model supports OpenAI-style tool calling.
+"""Probe how a TAMU AI Chat model can be made to call tools - in two separate ways.
 
-This is the project's main open risk: OpenAI-compatible proxies sometimes drop function
-calling, or support it only on some models. The agent loop in spice_mcp_app/llm.py is
-built on it, so it is worth confirming before building on top rather than after.
+OpenAI-compatible proxies sometimes drop function calling, or support it only on some
+routes. That is not hypothetical here: `protected.Claude Opus 4.8` emits `tool_calls`
+normally, and `us.anthropic.claude-opus-5` accepts the `tools` array and then answers as
+though it had no tools at all. The app supports both through `SPICE_MCP_TOOL_MODE`, and
+this script is how you tell which one a model needs.
 
     .venv\\Scripts\\activate
-    python scripts/probe_tool_calling.py                    # model from .env
-    python scripts/probe_tool_calling.py protected.gpt-5    # or an explicit one
+    python scripts/probe_tool_calling.py                                 # model from .env
+    python scripts/probe_tool_calling.py protected.gpt-5                 # or explicit
+    python scripts/probe_tool_calling.py us.anthropic.claude-opus-5 --prompted-json
 
-Three things are checked, in order, because each is a separate way the proxy can let us
-down:
+**These are two different capabilities and the script keeps them distinguishable.** The
+native probe is unchanged: it passes only when the model really does emit
+`message.tool_calls`, and no amount of prompted-JSON support makes it pass. Run it without
+a flag for native, with `--prompted-json` for the fallback.
+
+Native mode (default) checks three things, because each is a separate way the proxy can
+let us down:
 
   1. plain chat completion works at all, and `usage` is returned (the session log's
      token counts depend on it);
   2. the model emits `tool_calls` when given a `tools` array;
   3. a `role: "tool"` result is accepted back and produces a final answer.
 
-Exit code 0 means the full round trip works and the agent loop can proceed as planned.
-Non-zero means the fallback (a prompted JSON tool protocol) is needed.
+Prompted-JSON mode (`--prompted-json`) checks the fallback end to end, using the real
+protocol prompt and the real parser from `spice_mcp_app.llm` rather than a copy - so a
+pass here is evidence about the shipping code path, not about this script:
+
+  1. the same plain completion check;
+  2. `tools` is *not* sent; the model is asked to reply with one protocol JSON object,
+     and `parse_prompted_reply` accepts it as a tool call;
+  3. a "TOOL RESULT" message is accepted back and produces `{"type":"answer"}` that uses
+     the value only the tool could have supplied.
+
+Exit code 0 means the probed mode works end to end for that model.
 """
 
 from __future__ import annotations
 
+import argparse
 import json
 import sys
 from pathlib import Path
@@ -31,6 +49,13 @@ import requests
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from spice_mcp_app.config import ConfigError, load_config  # noqa: E402
+from spice_mcp_app.llm import (  # noqa: E402
+    PROMPTED_STOP,
+    ProtocolError,
+    parse_prompted_reply,
+    prompted_protocol_prompt,
+    prompted_tool_result_message,
+)
 
 # A deliberately trivial stand-in for a real MCP tool. The answer is not derivable
 # without calling it, so a model that answers without a tool call has ignored `tools`.
@@ -96,17 +121,8 @@ def show_usage(label: str, result: dict) -> bool:
     return usage.get("prompt_tokens") is not None
 
 
-def main() -> int:
-    try:
-        cfg = load_config()
-    except ConfigError as exc:
-        return int(bool(print(exc, file=sys.stderr))) or 1
-
-    model = sys.argv[1] if len(sys.argv) > 1 else cfg.model
-    print(f"Probing model: {model}")
-    print(f"Endpoint:      {cfg.chat_completions_url}\n")
-
-    # --- 1. plain completion + usage -------------------------------------------------
+def probe_plain(cfg, model: str) -> bool:
+    """Stage 1, shared by both modes: does the route answer at all, with usage?"""
     print("[1/3] plain chat completion")
     plain = post_chat(
         cfg,
@@ -118,8 +134,87 @@ def main() -> int:
     )
     text = (plain["choices"][0]["message"].get("content") or "").strip()
     print(f"  reply: {text!r}")
-    usage_ok = show_usage("usage", plain)
+    return show_usage("usage", plain)
 
+
+def probe_prompted_json(cfg, model: str, usage_ok: bool) -> int:
+    """The fallback protocol, exercised through the app's own prompt builder and parser.
+
+    Note what is deliberately absent from both requests: a `tools` key. On a route that
+    ignores `tools`, sending it would only make a pass ambiguous.
+    """
+    system = prompted_protocol_prompt([PROBE_TOOL])
+    messages: list[dict] = [
+        {"role": "system", "content": system},
+        {"role": "user", "content": PROBE_QUESTION},
+    ]
+
+    print("\n[2/3] prompted tool request")
+    print(f"  protocol prompt: {len(system)} chars, no `tools` field sent")
+    turn = post_chat(
+        cfg, {"model": model, "messages": messages, "stop": PROMPTED_STOP}
+    )
+    content = turn["choices"][0]["message"].get("content") or ""
+    print(f"  raw reply: {content.strip()[:300]!r}")
+    show_usage("usage", turn)
+
+    try:
+        parsed = parse_prompted_reply(content, known_tools=[PROBE_TOOL["function"]["name"]])
+    except ProtocolError as exc:
+        print(f"  the reply is not a protocol message: {exc}")
+        print("\nRESULT: prompted JSON tool calling FAILED for this model.")
+        return 1
+
+    if parsed["type"] != "tool_call":
+        print(f"  the model answered without calling the tool: {parsed!r}")
+        print(
+            "\nRESULT: prompted JSON tool calling FAILED - it guessed instead of "
+            "requesting the tool."
+        )
+        return 1
+    print(f"  parsed: name={parsed['name']!r} arguments={parsed['arguments']!r}")
+
+    # --- 3. feed a real result back through the framed message -----------------------
+    print("\n[3/3] TOOL RESULT round trip")
+    messages.append({"role": "assistant", "content": content})
+    messages.append(prompted_tool_result_message(parsed["name"], PROBE_TOOL_RESULT))
+    final = post_chat(
+        cfg, {"model": model, "messages": messages, "stop": PROMPTED_STOP}
+    )
+    final_content = final["choices"][0]["message"].get("content") or ""
+    print(f"  raw reply: {final_content.strip()[:300]!r}")
+    show_usage("usage", final)
+
+    try:
+        answer = parse_prompted_reply(
+            final_content, known_tools=[PROBE_TOOL["function"]["name"]]
+        )
+    except ProtocolError as exc:
+        print(f"  the reply is not a protocol message: {exc}")
+        print("\nRESULT: prompted JSON round trip FAILED at the result stage.")
+        return 1
+
+    print()
+    if answer["type"] != "answer":
+        print("RESULT: the model kept calling tools instead of answering. FAILED.")
+        return 1
+    if "100n" not in answer["text"].replace(" ", "") and "100" not in answer["text"]:
+        print(
+            "RESULT: the tool result was delivered but the answer does not use it. "
+            "Inspect the reply above before trusting the loop."
+        )
+        return 1
+    if not usage_ok:
+        print("RESULT: the protocol works but `usage` is missing; token logging needs work.")
+        return 1
+    print(
+        "RESULT: prompted JSON tool round trip works. Set "
+        "SPICE_MCP_TOOL_MODE=prompted_json for this model."
+    )
+    return 0
+
+
+def probe_native(cfg, model: str, usage_ok: bool) -> int:
     # --- 2. does it emit tool_calls? -------------------------------------------------
     print("\n[2/3] tool call request")
     messages: list[dict] = [{"role": "user", "content": PROBE_QUESTION}]
@@ -140,8 +235,9 @@ def main() -> int:
         print("  NO tool_calls returned.")
         print(f"  content was: {(message.get('content') or '')[:300]!r}")
         print(
-            "\nRESULT: this model ignored `tools`. Use the prompted-JSON fallback, or "
-            "try another model id from scripts/list_tamu_models.py."
+            "\nRESULT: this model ignored `tools`. Native tool calling is NOT available "
+            "on this route.\nRe-run with --prompted-json to check the fallback, and set "
+            "SPICE_MCP_TOOL_MODE=prompted_json if it passes."
         )
         return 1
 
@@ -176,7 +272,10 @@ def main() -> int:
     round_trip_ok = "100n" in final_text.replace(" ", "") or "100" in final_text
     print()
     if round_trip_ok and usage_ok:
-        print("RESULT: full tool-calling round trip works. Agent loop can proceed.")
+        print(
+            "RESULT: full native tool-calling round trip works. Leave "
+            "SPICE_MCP_TOOL_MODE at native for this model."
+        )
         return 0
     if not round_trip_ok:
         print(
@@ -186,6 +285,33 @@ def main() -> int:
         return 1
     print("RESULT: tool calling works but `usage` is missing; token logging needs work.")
     return 1
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("model", nargs="?", help="model id; defaults to SPICE_MCP_MODEL")
+    parser.add_argument(
+        "--prompted-json",
+        action="store_true",
+        help="probe the prompted-JSON fallback instead of native `tools` support",
+    )
+    args = parser.parse_args()
+
+    try:
+        cfg = load_config()
+    except ConfigError as exc:
+        return int(bool(print(exc, file=sys.stderr))) or 1
+
+    model = args.model or cfg.model
+    mode = "prompted_json" if args.prompted_json else "native"
+    print(f"Probing model: {model}")
+    print(f"Mode:          {mode}")
+    print(f"Endpoint:      {cfg.chat_completions_url}\n")
+
+    usage_ok = probe_plain(cfg, model)
+    if args.prompted_json:
+        return probe_prompted_json(cfg, model, usage_ok)
+    return probe_native(cfg, model, usage_ok)
 
 
 if __name__ == "__main__":

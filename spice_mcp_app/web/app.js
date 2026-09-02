@@ -95,7 +95,10 @@ window.addEventListener("pywebviewready", async () => {
     return;
   }
 
-  $("model").textContent = `${started.model} · ${started.tools.length} tools`;
+  /* The tool mode is shown only when it is not the OpenAI-native one, because that is
+     the case where a wrong setting looks like a working app that never calls a tool. */
+  const mode = started.tool_mode === "prompted_json" ? " · prompted JSON tools" : "";
+  $("model").textContent = `${started.model} · ${started.tools.length} tools${mode}`;
   $("session-path").textContent = started.session_path;
 
   const initial = await window.pywebview.api.get_initial_folder();

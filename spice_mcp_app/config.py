@@ -23,6 +23,20 @@ DEFAULT_BASE_URL = "https://gateway.api.tamu.ai"
 # space in the id is real - do not "clean it up".
 DEFAULT_MODEL = "protected.Claude Opus 4.8"
 
+# How the model is asked to call tools. Not derived from the model id: what the gateway
+# does with the `tools` field is a property of the *route*, not of the family name, and
+# guessing from a prefix would silently pick the wrong mode for the next model added.
+#   native        - the OpenAI `tools` array; the reply carries `message.tool_calls`.
+#                   Verified working on protected.Claude Opus 4.8.
+#   prompted_json - `tools` is not sent at all. The tool list goes in the system prompt
+#                   and the model replies with one JSON object per turn. For routes that
+#                   complete normally but ignore `tools` - verified on
+#                   us.anthropic.claude-opus-5, which answers as though no tools exist.
+TOOL_MODE_NATIVE = "native"
+TOOL_MODE_PROMPTED_JSON = "prompted_json"
+TOOL_MODES = (TOOL_MODE_NATIVE, TOOL_MODE_PROMPTED_JSON)
+DEFAULT_TOOL_MODE = TOOL_MODE_NATIVE
+
 SESSIONS_DIR = REPO_ROOT / "sessions"
 
 
@@ -36,6 +50,7 @@ class Config:
     model: str
     base_url: str
     sessions_dir: Path
+    tool_mode: str = DEFAULT_TOOL_MODE
 
     @property
     def chat_completions_url(self) -> str:
@@ -49,6 +64,7 @@ class Config:
             "api_key": fingerprint,
             "model": self.model,
             "base_url": self.base_url,
+            "tool_mode": self.tool_mode,
             "sessions_dir": str(self.sessions_dir),
         }
 
@@ -85,10 +101,29 @@ def load_config(*, require_key: bool = True) -> Config:
         api_key=api_key,
         model=(os.environ.get("SPICE_MCP_MODEL") or "").strip() or DEFAULT_MODEL,
         base_url=_normalize_base_url(os.environ.get("SPICE_MCP_BASE_URL")),
+        tool_mode=_resolve_tool_mode(os.environ.get("SPICE_MCP_TOOL_MODE")),
         sessions_dir=_resolve_sessions_dir(
             (os.environ.get("SPICE_MCP_SESSIONS_DIR") or "").strip()
         ),
     )
+
+
+def _resolve_tool_mode(raw: str | None) -> str:
+    """Validate SPICE_MCP_TOOL_MODE, rejecting typos rather than defaulting past them.
+
+    A silently ignored value here is the worst outcome: `prompted-json` with a hyphen
+    would fall back to `native`, the model would ignore `tools`, and the app would look
+    like it worked while never calling MCP - which is the bug this mode exists to fix.
+    """
+    value = (raw or "").strip().lower()
+    if not value:
+        return DEFAULT_TOOL_MODE
+    if value not in TOOL_MODES:
+        raise ConfigError(
+            f"SPICE_MCP_TOOL_MODE={raw!r} is not a known mode. "
+            f"Use one of: {', '.join(TOOL_MODES)}."
+        )
+    return value
 
 
 def _resolve_sessions_dir(raw: str) -> Path:

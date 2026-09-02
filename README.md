@@ -60,14 +60,37 @@ app environment. Put your chosen model id in `SPICE_MCP_MODEL` in `.env`.
 
 Model ids from this proxy can contain spaces (`protected.Claude Opus 4.8`). That is normal.
 
-The app needs the model to support **tool calling**. To check one before relying on it:
+The app needs the model to be able to **call tools**, and there are two ways it can:
 
 ```bat
-python scripts\probe_tool_calling.py
+python scripts\probe_tool_calling.py                                  REM native
+python scripts\probe_tool_calling.py <model id> --prompted-json       REM the fallback
 ```
 
-Three stages — a plain completion with usage, a `tool_calls` emission, and a `role:"tool"`
-round trip. It costs a few tokens. `protected.Claude Opus 4.8` passes all three.
+Native mode is three stages — a plain completion with usage, a `tool_calls` emission, and a
+`role:"tool"` round trip. It costs a few tokens. `protected.Claude Opus 4.8` passes all
+three, so leave `SPICE_MCP_TOOL_MODE` alone for it.
+
+Some routes on this proxy **accept the `tools` array and then answer as though they had no
+tools at all**. `us.anthropic.claude-opus-5` is one: in native mode it replies "I don't have
+any way to see your screen, files, or applications", and because that arrives as an ordinary
+completion the app has nothing to distinguish it from a finished answer — no tool is ever
+called. For those, set
+
+```
+SPICE_MCP_TOOL_MODE=prompted_json
+```
+
+which sends no `tools` field at all and instead puts a compact tool catalogue in the system
+prompt, with the model replying `{"type":"tool_call",…}` or `{"type":"answer",…}`. The app
+parses that strictly, runs the tool through the same MCP server, and hands the real result
+back framed as `TOOL RESULT`. Same tools, same approval gate, same token logging.
+
+`--prompted-json` probes that path using the app's own prompt builder and parser, so a pass
+is evidence about the shipping code. The two probes stay independent on purpose: a model
+that needs the fallback still prints FAIL for native, because that is the truth about it.
+Only `us.anthropic.claude-opus-5` has been checked — don't assume the other
+`us.anthropic.*` ids behave the same way; probe the one you pick.
 
 ## Running the app
 
@@ -217,6 +240,9 @@ value — approving `C1 → 100n` does not authorise `R1`, or a second write of 
 `tests/test_llm.py` asserts the refused call never reaches the server; the end-to-end script
 also asks the model to bypass the gate and checks the file comes back byte-identical.
 
+The gate sits on the executor, below both tool-calling modes, so `prompted_json` buys the
+model no extra reach — the same test drives the same unapproved write through both.
+
 When a write does happen it is surgical: the one `SYMATTR Value` line belonging to that
 component is rewritten, reusing the file's own indentation and line terminator. Encoding,
 line endings and every other byte are preserved, so the schematic still opens in the LTspice
@@ -228,7 +254,7 @@ GUI — which is the whole point of patching the `.asc` rather than a netlist.
 python -m pytest
 ```
 
-211 tests, ~29s. Parser and static-check tests run without LTspice installed; schematic
+257 tests, ~40s. Parser and static-check tests run without LTspice installed; schematic
 tests skip automatically if the executable is not found. Nothing in the suite calls the
 network, so running it costs no tokens — the live-model checks are the two scripts,
 `probe_tool_calling.py` and `app_smoke.py` (a headless nine-stage end-to-end run against

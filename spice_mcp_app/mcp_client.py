@@ -40,7 +40,9 @@ MAX_RESULT_CHARS = 60_000
 
 # Withheld from the server subprocess. These are the app half's business only, and the key
 # in particular has no reason to exist in a process that knows nothing about LLMs.
-_LLM_ONLY_ENV = frozenset({"TAMU_API_KEY", "SPICE_MCP_MODEL", "SPICE_MCP_BASE_URL"})
+_LLM_ONLY_ENV = frozenset(
+    {"TAMU_API_KEY", "SPICE_MCP_MODEL", "SPICE_MCP_BASE_URL", "SPICE_MCP_TOOL_MODE"}
+)
 
 
 class MCPClientError(RuntimeError):

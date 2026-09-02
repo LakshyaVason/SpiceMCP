@@ -36,6 +36,12 @@ log = logging.getLogger(__name__)
 
 PATCH_TOOL = "patch_component_value"
 
+# How many static findings are preloaded into the model's context when a circuit is
+# selected. A circuit with more problems than this has one underlying problem; the list is
+# the model's starting point, not the whole record, and the full result stays in the UI and
+# the session log either way.
+MAX_PRELOADED_FINDINGS = 12
+
 
 def _ok(**payload: Any) -> dict[str, Any]:
     return {"ok": True, **payload}
@@ -137,6 +143,7 @@ class Api:
 
         return _ok(
             model=self._config.model,
+            tool_mode=self._config.tool_mode,
             tools=[t["function"]["name"] for t in self._tools],
             session_id=self._session.session_id,
             session_path=str(self._session.path),
@@ -201,14 +208,7 @@ class Api:
         except json.JSONDecodeError:
             checks = {"summary": raw, "findings": [], "ok": False}
 
-        # Tell the model which file is open, with its absolute path. Without this it has
-        # no way to know and will guess a relative name, which the server then cannot
-        # find - the tools take a path argument, not an implicit "current circuit".
-        note = (
-            f"[The user has opened this circuit: {target}\n"
-            f"Use that exact absolute path in tool calls. "
-            f"Static checks already run: {checks.get('summary', 'n/a')}]"
-        )
+        note = self._selection_note(target, checks)
         self._history.append({"role": "user", "content": note})
         self._session.add_turn(Turn(role="user", text=note))
 
@@ -218,6 +218,48 @@ class Api:
             checks=checks,
             warning=self._ltspice_open_warning(target),
         )
+
+    @staticmethod
+    def _selection_note(target: Path, checks: dict[str, Any]) -> str:
+        """The context injected when a circuit is selected.
+
+        Two jobs. First, the absolute path: the tools take a path argument rather than
+        having an implicit "current circuit", and without being told, the model guesses a
+        relative name the server then cannot find.
+
+        Second, the static findings *themselves*. They are already computed and already
+        paid for by the time this runs, so summarising them as "Found 2 errors" was the
+        worst of both worlds - it told the model something was wrong without saying what,
+        which is an invitation to re-run the same check to find out. Handing over the
+        findings both saves that round trip and gives the model something to reason from.
+        """
+        findings = checks.get("findings") or []
+        lines = [
+            f"[The user has opened this circuit: {target}",
+            "Use that exact absolute path in tool calls.",
+            "check_netlist_static has already run on it - the findings are below, so do "
+            "not run it again unless the file changes.",
+            f"static check: {checks.get('summary', 'n/a')}",
+        ]
+        for finding in findings[:MAX_PRELOADED_FINDINGS]:
+            if not isinstance(finding, dict):
+                continue
+            where = ", ".join(
+                [*(finding.get("refs") or []), *(finding.get("nets") or [])]
+            )
+            line = (
+                f"- {finding.get('severity', '?')}/{finding.get('check', '?')}"
+                f"{f' [{where}]' if where else ''}: {finding.get('message', '')}"
+            )
+            if finding.get("suggestion"):
+                line += f" -> {finding['suggestion']}"
+            lines.append(line)
+        if len(findings) > MAX_PRELOADED_FINDINGS:
+            lines.append(
+                f"- ...and {len(findings) - MAX_PRELOADED_FINDINGS} more; "
+                f"re-run check_netlist_static to see them all."
+            )
+        return "\n".join(lines) + "]"
 
     def _ltspice_open_warning(self, target: Path) -> str | None:
         """Warn once that what we read from disk may not be what is on screen.
@@ -294,6 +336,7 @@ class Api:
                 tool_executor=self._tool_executor,
                 history=self._history,
                 on_progress=progress.append,
+                tool_mode=self._config.tool_mode,
             )
         except LLMError as exc:
             return _err(str(exc))

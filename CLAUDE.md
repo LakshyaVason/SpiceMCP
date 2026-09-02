@@ -131,8 +131,50 @@ seven.
   `{base_url}/v1/chat/completions` on `https://gateway.api.tamu.ai`.
 - **Tool calling works fully** on `protected.Claude Opus 4.8`: `tools` is accepted, the model
   emits OpenAI-shaped `tool_calls`, and a `role:"tool"` + `tool_call_id` reply closes the
-  round trip. The plan's prompted-JSON fallback is **not needed** — don't build it.
+  round trip.
 - The model id contains a space (`protected.Claude Opus 4.8`). That is real, not a typo.
+### Two tool-calling modes — `SPICE_MCP_TOOL_MODE` (verified 2026-09-01)
+
+**Not every route on this proxy can do native function calling, and the failure is silent.**
+`us.anthropic.claude-opus-5` accepts the `tools` array, ignores it, and answers "I don't have
+any way to see your screen, files, or applications" as an ordinary completion — so
+`if not tool_calls: return` treated that as a finished answer and **MCP was never called**.
+The suite passed the whole time, because `FakeClient` was returning `tool_calls`.
+
+`config.py` therefore has an explicit mode, never inferred from the model id:
+
+- `native` (default) — the `tools` array, `message.tool_calls`, `role:"tool"` results. Path
+  unchanged; verified on `protected.Claude Opus 4.8`.
+- `prompted_json` — **no `tools` field is sent at all.** The catalogue goes in the system
+  prompt (`prompted_protocol_prompt`) and every reply must be exactly one JSON object:
+  `{"type":"tool_call","name":…,"arguments":{…}}` or `{"type":"answer","text":…}`.
+
+Only `us.anthropic.claude-opus-5` has been probed. **Do not generalise to other
+`us.anthropic.*` ids** — `scripts\probe_tool_calling.py --prompted-json` is how you check
+one, and the native probe deliberately still prints FAIL for a model that needs the fallback.
+
+Both modes converge on `_execute_tool` → the caller's `tool_executor`, which is
+`Api._tool_executor`, so the approval gate covers prompted mode by construction rather than
+by a second copy of the check. `tests/test_llm.py::test_no_tool_mode_can_write_without_approval`
+is parametrized over both modes and asserts the refused call never reaches the server.
+
+Four things learned by running it, each of which cost a round before it was fixed:
+
+- **The model will role-play the tool result if you let it.** On the first live probe it
+  emitted a correct `tool_call` and then wrote its own `TOOL RESULT` with invented component
+  values plus an answer quoting them. Three defences: the protocol prompt says those messages
+  come from us; `PROMPTED_STOP = ["TOOL RESULT"]` (the gateway **does** honour `stop`); and
+  the parser is `raw_decode` from index 0, so anything after the first object is discarded
+  and logged. Prose *before* the object is still refused — `parse_prompted_reply` never goes
+  hunting for a brace in arbitrary text, and never treats markup as a tool call.
+- **Omitting `max_tokens` caps the completion at 1024**, which truncates a real diagnosis
+  mid-JSON. Hence `DEFAULT_MAX_REPLY_TOKENS = 2048`. Verified both ways: 1024 without,
+  4096 with `max_tokens=4096`, both `finish_reason: "length"`.
+- **`finish_reason == "length"` needs its own correction message.** Telling a model its JSON
+  was invalid when the cap cut it off sends it hunting for a syntax error it never made.
+- **Protocol failures are still billed**, so `_log_round` runs for every API response,
+  parseable or not. Otherwise the cost comparison would under-report.
+
 - **`SYMATTR Value2` is a trap.** `RCLP.asc`'s `V1` has both `Value` and `Value2` (`AC 0.7
   3000`). A `startswith("Value")` match patches the wrong line, so `asc.py` tokenises the
   attribute name.
@@ -189,7 +231,7 @@ into. Names starting with `_` are skipped, and objects can opt out with
 
 ```bat
 .venv\Scripts\activate
-python -m pytest                        REM 211 tests, ~29s
+python -m pytest                        REM 257 tests, ~40s
 python -m spice_mcp_app                 REM the desktop app; --folder fixtures --debug
 python -m spice_mcp_app --file fixtures\wrong_value_lowpass.asc   REM one circuit, pre-checked
 python -m spice_mcp_app.launch fixtures\wrong_value_lowpass.asc --no-ltspice
@@ -205,7 +247,7 @@ and `°`, which crash a cp1252 console.
 
 `.mcp.json` registers the server so it can be driven from Claude Code directly.
 
-## State: Steps 0–8 plus the Explorer launcher; 211 tests pass
+## State: Steps 0–8 plus the Explorer launcher; 257 tests pass
 
 **Server half — `spice_mcp_server/`, seven tools**, all verified over a real MCP stdio
 handshake. It still knows nothing about LLMs.
@@ -322,7 +364,7 @@ part that genuinely needs eyes.
 5. In LTspice: **File ▸ Revert** → `C1` shows the new value in the GUI. ← closes the GUI item.
 6. `python scripts\install_context_menu.py --uninstall` — the entry is gone.
 
-Automated up to that point: 211 tests, plus a headless launcher run verified to reach window
+Automated up to that point: 257 tests, plus a headless launcher run verified to reach window
 creation with `get_initial_folder()` returning the resolved folder and circuit, cwd back at
 the repo root, and nothing written beside the fixture.
 

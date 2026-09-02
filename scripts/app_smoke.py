@@ -16,6 +16,13 @@ simulates cleanly, and is still out of spec by 10x. Nothing but circuit reasonin
 it, so a pass here exercises the model rather than the parser.
 
 Makes real API calls, so it costs tokens. Exit code 0 means every stage passed.
+
+Runs in whichever tool-calling mode `SPICE_MCP_TOOL_MODE` selects, and stage 1 prints it,
+so this is also how you confirm a whole diagnosis works on a model that needs the
+prompted-JSON fallback:
+
+    SPICE_MCP_MODEL=us.anthropic.claude-opus-5 SPICE_MCP_TOOL_MODE=prompted_json \\
+        python scripts/app_smoke.py
 """
 
 from __future__ import annotations
@@ -67,6 +74,7 @@ def main() -> int:
     if not check("MCP server and session started", started.get("ok"), started.get("error", "")):
         return 1
     print(f"      model: {started['model']}")
+    print(f"      tool mode: {started['tool_mode']}")
     print(f"      tools: {', '.join(started['tools'])}")
     check("all seven tools exposed", len(started["tools"]) == 7, str(len(started["tools"])))
 
