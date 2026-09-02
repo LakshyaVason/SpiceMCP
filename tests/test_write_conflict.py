@@ -12,40 +12,10 @@ flaky test - it would go green on the machine where the feature is broken.
 
 from __future__ import annotations
 
-import json
-
 import pytest
 
-from spice_mcp_app.api import Api
-from spice_mcp_app.config import Config
-from spice_mcp_app.session import Session
-
-
-class FakeMCP:
-    """Records calls; reports a patch as applied so apply_patch reaches its warning."""
-
-    def __init__(self):
-        self.calls: list[tuple[str, dict]] = []
-
-    def call_tool(self, name, arguments, timeout=300.0):
-        self.calls.append((name, arguments))
-        if name == "check_netlist_static":
-            return json.dumps({"summary": "Static checks clean.", "findings": [], "ok": True})
-        return json.dumps({"applied": bool(arguments.get("apply")), "summary": "C1 -> 100n"})
-
-
-@pytest.fixture
-def api(tmp_path):
-    config = Config(
-        api_key="not-a-real-key",
-        model="fake-model",
-        base_url="https://example.invalid/openai",
-        sessions_dir=tmp_path,
-    )
-    instance = Api(config=config)
-    instance._mcp = FakeMCP()
-    instance._session = Session(model="fake-model", sessions_dir=tmp_path)
-    return instance
+# The `api` fixture - an Api on a FakeMCP with a temp session - lives in conftest.py, shared
+# with the approval-gate tests in test_llm.py. Two copies of that setup drifted apart once.
 
 
 @pytest.fixture

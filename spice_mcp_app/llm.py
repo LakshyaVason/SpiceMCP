@@ -1,30 +1,27 @@
-"""TAMU AI Chat client, MCP->OpenAI tool translation, and the agent loop.
+"""Bedrock client, MCP->Anthropic tool mapping, and the agent loop.
 
-The proxy is OpenAI-compatible, with two deviations found by probing it (see
-`scripts/probe_tool_calling.py`, which is the reproducer for both):
+The transport is AWS Bedrock through `anthropic.AnthropicBedrock`, which speaks the
+native Messages API. That means tool calling needs no translation layer: an MCP tool
+definition is already `{name, description, input_schema}`, which is exactly what
+Anthropic's `tools` parameter wants.
 
-  * **`"stream": false` must be sent explicitly.** Omit it and the proxy replies with
-    `text/event-stream` *and* drops the `usage` block entirely. Since per-turn token
-    counts are the reason the session log exists, every request forces it off.
-  * The TAMU gateway exposes the OpenAI-compatible API under `/v1` on the gateway host.
-    The correct path is `{base_url}/v1/chat/completions`.
+Facts about this transport that the code depends on:
 
-Native tool calling works fully on `protected.Claude Opus 4.8`: `tool_calls` come back
-with parseable JSON arguments, `role: "tool"` results are accepted, and `usage` is
-present on every turn.
-
-**It does not work on every route the gateway exposes.** On
-`us.anthropic.claude-opus-5` the `tools` array is accepted by the HTTP layer and then
-ignored: the model answers as though it had no tools at all ("I don't have any way to
-see your files..."), and because the reply carries no `tool_calls`, a loop that treats
-"no tool_calls" as "finished" returns that non-answer to the user and never calls MCP.
-So the fallback the plan held in reserve is needed after all, and is implemented here as
-`tool_mode="prompted_json"`: the tool list moves into the system prompt and the model
-replies with one JSON object per turn. See `scripts/probe_tool_calling.py`, which probes
-the two capabilities separately.
-
-Which mode to use is configuration (`SPICE_MCP_TOOL_MODE`), never inferred from the
-model id - what the gateway does with `tools` is a property of the route.
+  * **`max_tokens` is required on every request.** There is no default.
+  * **Never pass `thinking`.** Adaptive thinking is on by default for Opus 5, and
+    `thinking: {"type": "disabled"}` makes the model occasionally write a tool call into
+    its *visible text* instead of a `tool_use` block - the turn succeeds, the call never
+    runs, and nothing raises. That is precisely the failure this module was rewritten to
+    fix, so leaving thinking alone is load-bearing. `budget_tokens` is rejected with a
+    400 on Opus 5 and must not be reintroduced either.
+  * **Thinking blocks come back in `content` and must be handed back unchanged** when the
+    same turn carries a `tool_use`. The loop appends `response.content` verbatim, which
+    covers it; `_response_text` filters them out of what the user sees.
+  * **All results from one round go back in a single user message.** The model may emit
+    several `tool_use` blocks at once, and splitting their `tool_result` blocks across
+    messages is rejected.
+  * **Consecutive same-role turns are rejected.** `append_user_note` exists for that -
+    see its docstring.
 
 This module never imports `mcp`. It takes a `tool_executor` callable, which keeps the
 LLM side testable with a fake and the MCP side replaceable. Both modes converge on that
@@ -33,20 +30,16 @@ one callable, so the approval gate in `Api._tool_executor` covers both.
 
 from __future__ import annotations
 
-import json
 import logging
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any, Callable, Iterable, Protocol
 
-import requests
+import anthropic
+from anthropic import AnthropicBedrock
 
-from .config import (
-    TOOL_MODE_NATIVE,
-    TOOL_MODE_PROMPTED_JSON,
-    TOOL_MODES,
-    Config,
-)
-from .session import Session, Turn
+from .config import Config
+from .session import Session, Turn, usage_value
 
 log = logging.getLogger(__name__)
 
@@ -55,11 +48,8 @@ log = logging.getLogger(__name__)
 # rounds is stuck, and each round costs tokens.
 MAX_TOOL_ROUNDS = 12
 
-# In prompted-JSON mode a reply that is not protocol JSON costs a round to correct. One
-# correction is worth paying for (a stray code fence, a sentence of preamble); a model
-# that cannot produce the protocol twice in a row will not produce it on the third try
-# either, so the turn ends with its text rather than burning the whole round budget.
-MAX_PROTOCOL_CORRECTIONS = 2
+# Required by the API, and it has to leave room for thinking tokens as well as the answer.
+MAX_TOKENS = 16000
 
 SYSTEM_PROMPT = """\
 You are an expert analog circuit engineer helping debug LTspice circuits.
@@ -161,29 +151,17 @@ class ToolExecutor(Protocol):
 
 
 class LLMError(RuntimeError):
-    """A call to the chat API failed in a way worth showing the user."""
+    """A call to the model failed in a way worth showing the user."""
 
 
-class ProtocolError(ValueError):
-    """A prompted-mode reply was not a valid protocol message.
+def mcp_tools_to_anthropic(mcp_tools: Iterable[Any]) -> list[dict[str, Any]]:
+    """Map MCP tool definitions onto Anthropic's `tools` parameter.
 
-    `requested_name` is set when the reply did name a tool - an unknown name, say - so
-    the caller can record the rejected attempt without executing anything.
+    Barely a translation: MCP Python objects are already snake_case (`input_schema`),
+    which is the name Anthropic uses too. Tools arrive from `client.list_tools()` as
+    objects, but dicts are accepted so tests can pass literals.
     """
-
-    def __init__(self, message: str, *, requested_name: str | None = None) -> None:
-        super().__init__(message)
-        self.requested_name = requested_name
-
-
-def mcp_tools_to_openai(mcp_tools: Iterable[Any]) -> list[dict[str, Any]]:
-    """Translate MCP tool definitions into the OpenAI `tools` array.
-
-    MCP Python objects are snake_case (`input_schema`), unlike the wire format. Tools
-    arrive from `client.list_tools()` as objects, but dicts are accepted too so tests
-    can pass literals.
-    """
-    translated: list[dict[str, Any]] = []
+    mapped: list[dict[str, Any]] = []
     for tool in mcp_tools:
         if isinstance(tool, dict):
             name = tool.get("name")
@@ -200,163 +178,16 @@ def mcp_tools_to_openai(mcp_tools: Iterable[Any]) -> list[dict[str, Any]]:
             log.warning("skipping a tool with no name: %r", tool)
             continue
 
-        translated.append(
+        mapped.append(
             {
-                "type": "function",
-                "function": {
-                    "name": name,
-                    "description": description,
-                    # An empty-but-valid object schema, because some providers reject
-                    # a function whose parameters are null.
-                    "parameters": schema
-                    or {"type": "object", "properties": {}},
-                },
+                "name": name,
+                "description": description,
+                # input_schema is required, not optional - a tool without one is
+                # rejected outright, so the empty-but-valid object is load-bearing.
+                "input_schema": schema or {"type": "object", "properties": {}},
             }
         )
-    return translated
-
-
-def _tool_spec(tool: dict[str, Any]) -> tuple[str, str, dict[str, Any]]:
-    """Pull (name, description, schema) out of one OpenAI-shaped tool definition."""
-    function = tool.get("function") if isinstance(tool, dict) else None
-    source = function if isinstance(function, dict) else (tool if isinstance(tool, dict) else {})
-    schema = source.get("parameters") or {"type": "object", "properties": {}}
-    return (
-        str(source.get("name") or ""),
-        str(source.get("description") or ""),
-        schema,
-    )
-
-
-def tool_names(tools: Iterable[dict[str, Any]] | None) -> list[str]:
-    """The tool names in an OpenAI `tools` array, in order."""
-    return [name for name, _, _ in (_tool_spec(t) for t in tools or []) if name]
-
-
-def prompted_protocol_prompt(tools: Iterable[dict[str, Any]] | None) -> str:
-    """Render the protocol and the tool catalogue for the system prompt.
-
-    Takes the same OpenAI-shaped `tools` array that native mode sends over the wire, so
-    there is one source of truth for what the model is told a tool takes - and so the
-    two modes stay comparable on tokens: the descriptions and schemas are identical, only
-    the transport differs.
-    """
-    lines = [PROMPTED_PROTOCOL_HEADER]
-    for tool in tools or []:
-        name, description, schema = _tool_spec(tool)
-        if not name:
-            continue
-        lines.append(f"\n{name}")
-        if description:
-            lines.append(description.strip())
-        # Compact separators: the schema is machine-readable input for the model, and
-        # pretty-printing it would cost tokens for whitespace on every round.
-        lines.append(
-            "arguments: " + json.dumps(schema, separators=(",", ":"), sort_keys=False)
-        )
-    return "\n".join(lines)
-
-
-def _strip_code_fence(text: str) -> str:
-    """Remove one wrapping ``` fence, if that is all that is wrong with the reply.
-
-    Narrow on purpose. A fence is the one formatting habit worth tolerating, because
-    models add it reflexively to anything that looks like JSON. Anything beyond it -
-    prose, several objects, tag markup - is left to fail parsing and earn a correction,
-    because guessing at which brace in a paragraph was meant to be a tool call is how
-    you end up executing something the model never asked for.
-    """
-    stripped = text.strip()
-    if not stripped.startswith("```"):
-        return stripped
-    body = stripped[3:]
-    newline = body.find("\n")
-    if newline == -1:
-        return stripped
-    # Only the language tag may sit on the opening line ("```json").
-    if body[:newline].strip().isalpha() or not body[:newline].strip():
-        body = body[newline + 1 :]
-    else:
-        return stripped
-    if body.rstrip().endswith("```"):
-        body = body.rstrip()[:-3]
-    return body.strip()
-
-
-def parse_prompted_reply(text: str, *, known_tools: Iterable[str]) -> dict[str, Any]:
-    """Validate one prompted-mode reply and return a normalized protocol message.
-
-    Returns either `{"type": "tool_call", "name": str, "arguments": dict}` or
-    `{"type": "answer", "text": str}`. Raises `ProtocolError` for anything else - and
-    raising is the point: nothing is executed unless the request parsed *and* named a
-    tool the app actually supplied.
-    """
-    candidate = _strip_code_fence(text or "")
-    if not candidate:
-        raise ProtocolError("Your reply was empty.")
-
-    # Decoded from position 0, so the reply must *begin* with the JSON object - no
-    # searching the text for something brace-shaped. Anything after the first object is
-    # discarded, which is the safe direction: a model that role-plays the rest of the
-    # exchange (a fabricated TOOL RESULT and an answer quoting it - observed live) gets
-    # its real first request executed and its invented remainder thrown away.
-    try:
-        payload, end = json.JSONDecoder().raw_decode(candidate)
-    except json.JSONDecodeError as exc:
-        raise ProtocolError(f"Your reply was not valid JSON ({exc.msg}).") from exc
-
-    trailing = candidate[end:].strip()
-    if trailing:
-        log.warning(
-            "discarded %d characters after the protocol object: %.200s",
-            len(trailing),
-            trailing,
-        )
-
-    if not isinstance(payload, dict):
-        raise ProtocolError("The JSON must be an object, not a list or a bare value.")
-
-    kind = payload.get("type")
-    if kind == "answer":
-        answer = payload.get("text")
-        if not isinstance(answer, str):
-            raise ProtocolError('An "answer" needs a "text" string.')
-        return {"type": "answer", "text": answer}
-
-    if kind != "tool_call":
-        raise ProtocolError('"type" must be "tool_call" or "answer".')
-
-    name = payload.get("name")
-    if not isinstance(name, str) or not name:
-        raise ProtocolError('A "tool_call" needs a "name" string.')
-
-    arguments = payload.get("arguments")
-    if arguments is None:
-        arguments = {}
-    if not isinstance(arguments, dict):
-        raise ProtocolError(
-            '"arguments" must be an object of named arguments.', requested_name=name
-        )
-
-    allowed = list(known_tools)
-    if name not in allowed:
-        raise ProtocolError(
-            f"There is no tool called {name!r}. The tools you have are: "
-            f"{', '.join(allowed) or '(none)'}.",
-            requested_name=name,
-        )
-
-    return {"type": "tool_call", "name": name, "arguments": arguments}
-
-
-def prompted_tool_result_message(name: str, result: str) -> dict[str, Any]:
-    """Frame a real tool result so the model cannot mistake its own text for one.
-
-    Sent as a user-role message because prompted mode has no `tool_call_id` to attach a
-    `role: "tool"` message to. The "TOOL RESULT" label is what the system prompt tells
-    the model is the only genuine tool output.
-    """
-    return {"role": "user", "content": f"TOOL RESULT\nname: {name}\nresult:\n{result}"}
+    return mapped
 
 
 @dataclass
@@ -390,13 +221,15 @@ class AgentResult:
     protocol_errors: int = 0
 
 
-class TamuClient:
-    """Thin HTTP client for the TAMU chat completions endpoint."""
+class BedrockClient:
+    """Thin wrapper over AnthropicBedrock, and the one place errors become LLMError."""
 
     def __init__(self, config: Config, *, timeout: float = 180.0) -> None:
         self._config = config
-        self._timeout = timeout
-        self._http = requests.Session()
+        # Credentials are left to the SDK's default chain on purpose - see config.py.
+        self._client = AnthropicBedrock(
+            aws_region=config.aws_region, timeout=timeout
+        )
 
     @property
     def model(self) -> str:
@@ -407,150 +240,87 @@ class TamuClient:
         messages: list[dict[str, Any]],
         *,
         tools: list[dict[str, Any]] | None = None,
-        max_tokens: int | None = DEFAULT_MAX_REPLY_TOKENS,
-        stop: list[str] | None = None,
-    ) -> dict[str, Any]:
-        """One chat completion. Returns the raw OpenAI-shaped response body."""
-        payload: dict[str, Any] = {
-            "model": self._config.model,
-            "messages": messages,
-            # Not a default on this proxy - see the module docstring.
-            "stream": False,
-        }
-        if tools:
-            payload["tools"] = tools
-            payload["tool_choice"] = "auto"
-        if max_tokens is not None:
-            payload["max_tokens"] = max_tokens
-        if stop:
-            # Honoured by the gateway: verified on us.anthropic.claude-opus-5, which
-            # returns finish_reason "stop" with the text cut before the sequence.
-            payload["stop"] = stop
-
+        system: str = SYSTEM_PROMPT,
+        max_tokens: int = MAX_TOKENS,
+    ) -> Any:
+        """One turn. Returns the SDK's Message object."""
         try:
-            response = self._http.post(
-                self._config.chat_completions_url,
-                headers={
-                    "accept": "application/json",
-                    "Content-Type": "application/json",
-                    "Authorization": f"Bearer {self._config.api_key}",
-                },
-                json=payload,
-                timeout=self._timeout,
+            return self._client.messages.create(
+                model=self._config.model,
+                max_tokens=max_tokens,
+                system=system,
+                messages=messages,
+                tools=tools or anthropic.NOT_GIVEN,
             )
-        except requests.RequestException as exc:
-            raise LLMError(f"Could not reach the chat API: {exc}") from exc
-
-        if response.status_code >= 400:
-            # The body carries the proxy's own explanation, which is usually the
-            # actual diagnosis (a rejected key, an unknown model, tools unsupported).
-            detail = response.text[:1000]
+        except (anthropic.NotFoundError, anthropic.PermissionDeniedError) as exc:
+            # By far the most likely first-run failure, and the SDK's own message does not
+            # say what to do about it. Both shapes mean the same thing in practice.
             raise LLMError(
-                f"Chat API returned HTTP {response.status_code}.\n{detail}"
-            )
-
-        try:
-            body = response.json()
-        except ValueError as exc:
-            content_type = response.headers.get("content-type", "?")
-            raise LLMError(
-                f"Chat API returned {content_type} rather than JSON, so there is no "
-                f"usage block to log.\n{response.text[:500]}"
+                f"Bedrock will not serve {self._config.model} in "
+                f"{self._config.aws_region}.\n\n"
+                "Either the inference profile does not exist in that region or the "
+                "account has not been granted access to it. Check with "
+                "`python scripts/list_bedrock_models.py`, then enable the model in the "
+                "Bedrock console or set SPICE_MCP_AWS_REGION to a region where it is "
+                f"enabled.\n\n{exc}"
             ) from exc
+        except anthropic.AuthenticationError as exc:
+            raise LLMError(
+                "Bedrock rejected the credentials "
+                f"({self._config.credentials_source}).\n\n{exc}"
+            ) from exc
+        except anthropic.APIError as exc:
+            raise LLMError(f"The Bedrock call failed: {exc}") from exc
+        except Exception as exc:
+            # botocore raises its own exceptions during credential resolution and SigV4
+            # signing, before the anthropic layer sees anything.
+            raise LLMError(f"Could not reach Bedrock: {exc}") from exc
 
-        if not body.get("choices"):
-            raise LLMError(f"Chat API returned no choices: {json.dumps(body)[:500]}")
-        return body
+
+def _block_field(block: Any, name: str) -> Any:
+    """Read a field from a content block, tolerating dicts as well as SDK objects."""
+    if isinstance(block, Mapping):
+        return block.get(name)
+    return getattr(block, name, None)
 
 
-def _message_text(message: dict[str, Any]) -> str:
-    """Extract text from a message, tolerating content-part lists."""
-    content = message.get("content")
+def _response_text(response: Any) -> str:
+    """Join the visible text of a response, skipping thinking and tool_use blocks."""
+    content = _block_field(response, "content")
     if isinstance(content, str):
         return content
-    if isinstance(content, list):
-        parts = [
-            part.get("text", "")
-            for part in content
-            if isinstance(part, dict) and part.get("type") == "text"
-        ]
-        return "".join(parts)
-    return ""
+    if not content:
+        return ""
+    parts = [
+        _block_field(block, "text") or ""
+        for block in content
+        if _block_field(block, "type") == "text"
+    ]
+    return "".join(parts)
 
 
-def _execute_tool(
-    tool_executor: ToolExecutor | None,
-    name: str,
-    arguments: dict[str, Any],
-    on_progress: Callable[[str], None] | None,
-) -> ToolCallRecord:
-    """Run one tool through the caller's executor and record what came back.
+def append_user_note(history: list[dict[str, Any]], text: str) -> None:
+    """Add user-role text to the history without creating two consecutive user turns.
 
-    The single place either mode reaches MCP. Both loops funnel through here, so the
-    approval gate the executor implements cannot be sidestepped by picking a mode.
+    The Messages API rejects consecutive same-role messages, so a note the app wants the
+    model to see - "the user opened this circuit", "the user approved your fix" - cannot
+    simply be appended: the next question would append a second user turn behind it and
+    the request would be refused. Folding it into the pending turn keeps the note intact
+    and the history valid, and means callers never have to think about ordering.
     """
-    if tool_executor is None:
-        return ToolCallRecord(name, arguments, "No tools are available in this session.", True)
-
-    if on_progress:
-        on_progress(f"{name}({', '.join(f'{k}={v!r}' for k, v in arguments.items())})")
-    try:
-        return ToolCallRecord(name, arguments, tool_executor(name, arguments), False)
-    except Exception as exc:
-        # Hand the failure to the model rather than aborting: a bad path or an
-        # unsupported file is something it can recover from by calling the tool
-        # differently.
-        log.warning("tool %s failed: %s", name, exc)
-        return ToolCallRecord(name, arguments, f"Tool {name} failed: {exc}", True)
-
-
-def _usage_tokens(usage: dict[str, Any]) -> tuple[int, int]:
-    return int(usage.get("prompt_tokens") or 0), int(usage.get("completion_tokens") or 0)
-
-
-def _log_round(
-    session: Session,
-    text: str,
-    usage: dict[str, Any],
-    round_records: list[ToolCallRecord],
-) -> None:
-    """Write one model round to the session log: the assistant turn, then its results.
-
-    Called for every API response in both modes, including ones that failed to parse -
-    the request was billed either way, and a log that quietly omits the expensive rounds
-    would misreport the cost comparison this project exists to make.
-    """
-    session.add_turn(
-        Turn.from_usage(
-            "assistant",
-            text,
-            usage,
-            tool_calls=[r.to_dict() for r in round_records] or None,
-        )
-    )
-    for record in round_records:
-        session.add_turn(Turn(role="tool", text=record.result))
-
-
-def _exhausted(
-    records: list[ToolCallRecord], total_in: int, total_out: int, protocol_errors: int = 0
-) -> AgentResult:
-    """Out of rounds. Return the partial work rather than raising - it was paid for."""
-    return AgentResult(
-        text=(
-            f"Stopped after {MAX_TOOL_ROUNDS} tool rounds without a final answer. "
-            "The last tool results are above; try asking a narrower question."
-        ),
-        tool_calls=records,
-        rounds=MAX_TOOL_ROUNDS,
-        input_tokens=total_in,
-        output_tokens=total_out,
-        protocol_errors=protocol_errors,
-    )
+    if history and history[-1].get("role") == "user":
+        content = history[-1].get("content")
+        if isinstance(content, str):
+            history[-1]["content"] = f"{content}\n\n{text}"
+            return
+        if isinstance(content, list):
+            content.append({"type": "text", "text": text})
+            return
+    history.append({"role": "user", "content": text})
 
 
 def run_agent_turn(
-    client: TamuClient,
+    client: BedrockClient,
     session: Session,
     user_text: str,
     *,
@@ -562,8 +332,9 @@ def run_agent_turn(
 ) -> AgentResult:
     """Run one user turn to completion, executing tool calls as the model asks.
 
-    `history` is the running OpenAI-format message list and is mutated in place, so the
-    caller keeps conversational context across turns. The session log is updated as
+    `history` is the running Messages-API message list and is mutated in place, so the
+    caller keeps conversational context across turns. The system prompt is *not* in
+    there - it is a top-level parameter on every request. The session log is updated as
     each turn completes rather than at the end, so an interrupted session still leaves
     complete token counts behind.
 
@@ -578,13 +349,8 @@ def run_agent_turn(
 
     if history is None:
         history = []
-    if not history or history[0].get("role") != "system":
-        system_prompt = SYSTEM_PROMPT
-        if tool_mode == TOOL_MODE_PROMPTED_JSON:
-            system_prompt += "\n\n" + prompted_protocol_prompt(tools)
-        history.insert(0, {"role": "system", "content": system_prompt})
 
-    history.append({"role": "user", "content": user_text})
+    append_user_note(history, user_text)
     session.add_turn(Turn(role="user", text=user_text))
 
     if tool_mode == TOOL_MODE_PROMPTED_JSON:
@@ -608,50 +374,91 @@ def _run_native_turn(
     total_out = 0
 
     for round_index in range(1, MAX_TOOL_ROUNDS + 1):
-        body = client.complete(history, tools=tools)
-        message = body["choices"][0]["message"]
-        usage = body.get("usage") or {}
-        round_in, round_out = _usage_tokens(usage)
-        total_in += round_in
-        total_out += round_out
+        response = client.complete(history, tools=tools)
+        usage = _block_field(response, "usage")
+        total_in += int(usage_value(usage, "input_tokens") or 0)
+        total_out += int(usage_value(usage, "output_tokens") or 0)
 
-        text = _message_text(message)
-        tool_calls = message.get("tool_calls") or []
+        text = _response_text(response)
+        stop_reason = _block_field(response, "stop_reason")
+        content = _block_field(response, "content") or []
+        tool_uses = [b for b in content if _block_field(b, "type") == "tool_use"]
 
-        # Append the assistant message verbatim: the provider needs its own tool_calls
-        # structure back unchanged to match the tool results to it.
-        history.append(message)
+        # Append the content verbatim: the tool_use blocks have to come back unchanged for
+        # the results to match up, and so do any thinking blocks alongside them.
+        history.append({"role": "assistant", "content": content})
 
         round_records: list[ToolCallRecord] = []
-        for call in tool_calls:
-            function = call.get("function") or {}
-            name = function.get("name") or "?"
-            raw_args = function.get("arguments") or "{}"
-            try:
-                arguments = json.loads(raw_args) if raw_args.strip() else {}
-            except json.JSONDecodeError as exc:
-                record = ToolCallRecord(
-                    name,
-                    {},
-                    f"Your arguments were not valid JSON ({exc}). Raw: {raw_args}",
-                    True,
-                )
-            else:
-                record = _execute_tool(tool_executor, name, arguments, on_progress)
+        results: list[dict[str, Any]] = []
+        for block in tool_uses:
+            name = _block_field(block, "name") or "?"
+            # The API parses tool input for us, so this is a dict in practice. The check is
+            # not decoration: the approval gate in api.py reads arguments.get("apply"), and
+            # a non-dict would make that check silently pass, so never hand one onward.
+            raw_input = _block_field(block, "input")
+            valid_input = isinstance(raw_input, Mapping)
+            arguments = dict(raw_input) if valid_input else {}
 
+            if not valid_input:
+                log.warning("tool %s sent non-dict input: %r", name, raw_input)
+                result = (
+                    f"Your input for {name} was not an object. Send the arguments as "
+                    "a JSON object and try again."
+                )
+                is_error = True
+            elif tool_executor is None:
+                result = "No tools are available in this session."
+                is_error = True
+            else:
+                if on_progress:
+                    on_progress(
+                        f"{name}({', '.join(f'{k}={v!r}' for k, v in arguments.items())})"
+                    )
+                try:
+                    result = tool_executor(name, arguments)
+                    is_error = False
+                except Exception as exc:
+                    # Hand the failure to the model rather than aborting: a bad path or
+                    # an unsupported file is something it can recover from by calling the
+                    # tool differently.
+                    log.warning("tool %s failed: %s", name, exc)
+                    result = f"Tool {name} failed: {exc}"
+                    is_error = True
+
+            record = ToolCallRecord(name, arguments, result, is_error)
             round_records.append(record)
             records.append(record)
-            history.append(
+            results.append(
                 {
-                    "role": "tool",
-                    "tool_call_id": call.get("id"),
-                    "content": record.result,
+                    "type": "tool_result",
+                    "tool_use_id": _block_field(block, "id"),
+                    "content": result,
+                    "is_error": is_error,
                 }
             )
 
-        _log_round(session, text, usage, round_records)
+        if results:
+            # One message carrying every result from this round. Splitting them is rejected.
+            history.append({"role": "user", "content": results})
 
-        if not tool_calls:
+        session.add_turn(
+            Turn.from_usage(
+                "assistant",
+                text,
+                usage,
+                tool_calls=[r.to_dict() for r in round_records] or None,
+            )
+        )
+        for record in round_records:
+            session.add_turn(Turn(role="tool", text=record.result))
+
+        if stop_reason != "tool_use":
+            if stop_reason == "max_tokens":
+                # Say so rather than presenting a truncated diagnosis as a finished one.
+                text = (
+                    f"{text}\n\n[Cut off at the {MAX_TOKENS}-token limit, so this answer "
+                    "is incomplete. Try asking a narrower question.]"
+                ).strip()
             return AgentResult(
                 text=text,
                 tool_calls=records,

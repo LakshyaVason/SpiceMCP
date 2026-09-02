@@ -16,8 +16,15 @@ the LTspice GUI, the sim is re-run to confirm, and every turn's token usage is l
 
 ## Hard constraints — do not relax these
 
-1. **No secrets in source.** The TAMU key loads from `TAMU_API_KEY` in a git-ignored `.env`
-   or the environment. Never hardcode, never log it. `.env.example` documents the shape.
+1. **No secrets in source — and none in `Config` either.** Bedrock auth is IAM-based, so
+   there is no bearer key for this app to hold: credentials are resolved by the AWS default
+   chain *inside the SDK*. `Config` carries `model`, `aws_region`, a `credentials_source`
+   **label** and `sessions_dir`, and nothing else — so there is nothing for a stray debug
+   print or a `repr()` in a traceback to leak, by construction rather than by filtering.
+   `redacted()` reports which *style* of credential was found ("environment keys",
+   "profile:x"), never its value; `tests/test_config.py` sweeps its output for the secret.
+   `.env` (git-ignored) may hold `AWS_*` variables as a convenience; `.env.example`
+   documents all three styles as optional.
 2. **Never write into the user's source directory.** LTspice writes `-netlist` and `-b`
    output *next to the input file*, so every invocation stages the input into
    `%TEMP%\spice_mcp_work\` first. This is not hypothetical: an ad-hoc shell command during
@@ -45,8 +52,11 @@ the LTspice GUI, the sim is re-run to confirm, and every turn's token usage is l
 - Name: "SPICE MCP client". Repo stays `SpiceMCP`.
 - Python-only desktop app (pywebview/PySide). No Electron, no Node toolchain.
 - `spicelib` is an accepted dependency; no from-scratch parser.
-- LLM is the **TAMU AI Gateway** (`https://gateway.api.tamu.ai`), OpenAI-compatible —
-  not Anthropic directly.
+- LLM is **Claude on AWS Bedrock**, via `anthropic.AnthropicBedrock` and the native Messages
+  API. Chosen over the TAMU AI Gateway (retired 2026-09-01) because the deliverable is a cost
+  comparison and Bedrock bills per call through CloudWatch/Cost Explorer, where TAMU only
+  showed a cumulative dashboard. `AnthropicBedrockMantle` and `AnthropicAWS` were considered
+  and declined — `AnthropicBedrock` reaches Opus 5 and is what the brief specified.
 - Two-process MCP split over local stdio. The server **must never learn what an LLM is** —
   that's what makes it reusable for the later EDA-tool work.
 
@@ -121,60 +131,44 @@ MCP tool — it is a UX detail the model never needs, and an eighth tool schema 
 for in every request. `tests/test_write_conflict.py` asserts the tool set is still exactly
 seven.
 
-### TAMU proxy facts (verified 2026-08-29 via `scripts\probe_tool_calling.py`)
+### Bedrock / Messages API facts
 
-- **`"stream": false` is mandatory, not the default.** Omit it and the proxy answers with
-  `Content-Type: text/event-stream` — `response.json()` raises `JSONDecodeError` on line 1 —
-  **and the streamed form carries no `usage` block at all.** Silently null token counts would
-  invalidate the whole cost comparison, so `TamuClient.complete` always sends it.
-- **Use the gateway host with `/v1` in the path.** The correct URL is
-  `{base_url}/v1/chat/completions` on `https://gateway.api.tamu.ai`.
-- **Tool calling works fully** on `protected.Claude Opus 4.8`: `tools` is accepted, the model
-  emits OpenAI-shaped `tool_calls`, and a `role:"tool"` + `tool_call_id` reply closes the
-  round trip.
-- The model id contains a space (`protected.Claude Opus 4.8`). That is real, not a typo.
-### Two tool-calling modes — `SPICE_MCP_TOOL_MODE` (verified 2026-09-01)
+The transport was OpenAI-shaped until 2026-09-01. The failure that forced the migration is
+worth keeping in mind, because it is silent: given an OpenAI `tools` array a Claude model
+**narrates the tool call as prose in its visible text** — the turn "succeeds", no call runs,
+and nothing raises. `sessions/beda7b77-….json` is the evidence (no `tool_calls` on any turn,
+assistant text containing raw `antml:invoke` syntax and an invented netlist). A session log
+with no `tool_calls` key is the symptom to look for.
 
-**Not every route on this proxy can do native function calling, and the failure is silent.**
-`us.anthropic.claude-opus-5` accepts the `tools` array, ignores it, and answers "I don't have
-any way to see your screen, files, or applications" as an ordinary completion — so
-`if not tool_calls: return` treated that as a finished answer and **MCP was never called**.
-The suite passed the whole time, because `FakeClient` was returning `tool_calls`.
-
-`config.py` therefore has an explicit mode, never inferred from the model id:
-
-- `native` (default) — the `tools` array, `message.tool_calls`, `role:"tool"` results. Path
-  unchanged; verified on `protected.Claude Opus 4.8`.
-- `prompted_json` — **no `tools` field is sent at all.** The catalogue goes in the system
-  prompt (`prompted_protocol_prompt`) and every reply must be exactly one JSON object:
-  `{"type":"tool_call","name":…,"arguments":{…}}` or `{"type":"answer","text":…}`.
-
-Only `us.anthropic.claude-opus-5` has been probed. **Do not generalise to other
-`us.anthropic.*` ids** — `scripts\probe_tool_calling.py --prompted-json` is how you check
-one, and the native probe deliberately still prints FAIL for a model that needs the fallback.
-
-Both modes converge on `_execute_tool` → the caller's `tool_executor`, which is
-`Api._tool_executor`, so the approval gate covers prompted mode by construction rather than
-by a second copy of the check. `tests/test_llm.py::test_no_tool_mode_can_write_without_approval`
-is parametrized over both modes and asserts the refused call never reaches the server.
-
-Four things learned by running it, each of which cost a round before it was fixed:
-
-- **The model will role-play the tool result if you let it.** On the first live probe it
-  emitted a correct `tool_call` and then wrote its own `TOOL RESULT` with invented component
-  values plus an answer quoting them. Three defences: the protocol prompt says those messages
-  come from us; `PROMPTED_STOP = ["TOOL RESULT"]` (the gateway **does** honour `stop`); and
-  the parser is `raw_decode` from index 0, so anything after the first object is discarded
-  and logged. Prose *before* the object is still refused — `parse_prompted_reply` never goes
-  hunting for a brace in arbitrary text, and never treats markup as a tool call.
-- **Omitting `max_tokens` caps the completion at 1024**, which truncates a real diagnosis
-  mid-JSON. Hence `DEFAULT_MAX_REPLY_TOKENS = 2048`. Verified both ways: 1024 without,
-  4096 with `max_tokens=4096`, both `finish_reason: "length"`.
-- **`finish_reason == "length"` needs its own correction message.** Telling a model its JSON
-  was invalid when the cap cut it off sends it hunting for a syntax error it never made.
-- **Protocol failures are still billed**, so `_log_round` runs for every API response,
-  parseable or not. Otherwise the cost comparison would under-report.
-
+- **`max_tokens` is required on every request.** There is no default. `MAX_TOKENS = 16000`,
+  sized to leave room for thinking tokens as well as the answer.
+- **Never pass `thinking`.** Adaptive thinking is on by default on Opus 5, and
+  `thinking: {"type": "disabled"}` makes it occasionally write a tool call into visible text
+  instead of a `tool_use` block — the exact failure above. `budget_tokens` is rejected with a
+  400 on Opus 5; don't reintroduce it either.
+- **Thinking blocks come back in `content` and must be handed back unchanged** alongside a
+  `tool_use` from the same turn. The loop appends `response.content` verbatim, which covers
+  it; `_response_text` filters them out of what the user sees.
+- **All `tool_result` blocks from one round go back in a single user message**, keyed by
+  `tool_use_id`. The model may emit several `tool_use` blocks at once and splitting their
+  results across messages is rejected.
+- **Consecutive same-role turns are rejected**, which OpenAI tolerated. `api.py` appends
+  user-role notes ("the user opened this circuit", "the user approved your fix") and then the
+  user's question appends another — hence `llm.py:append_user_note`, which folds a note into
+  the pending user turn instead of adding a second one.
+- **`tool_use.input` arrives already parsed.** There is no `json.loads`, and so no
+  malformed-arguments failure mode — but `llm.py` still guards that it is a `Mapping`, because
+  the approval gate reads `arguments.get("apply")` and on a non-dict that check cannot fire:
+  the gate would fail *open*.
+- **There is no system *role*.** The system prompt is a top-level `system=` parameter, sent on
+  every request. A `{"role": "system"}` message in the history is a 400.
+- **`SPICE_MCP_MODEL` is a Bedrock inference profile id**, not a display name — and it is
+  region-scoped. `us.anthropic.claude-opus-5` is billed at a **10% premium** over
+  `global.anthropic.claude-opus-5`; say so in the cost write-up so the number is not read as
+  base pricing. `scripts\list_bedrock_models.py` lists what the account actually has.
+- Bedrock does **not** offer server-side web search/fetch, code execution, the Batches/Files
+  APIs, or Agent Skills. Messages, streaming, tool use, adaptive thinking, prompt caching and
+  token counting all work. None of the missing pieces are used here.
 - **`SYMATTR Value2` is a trap.** `RCLP.asc`'s `V1` has both `Value` and `Value2` (`AC 0.7
   3000`). A `startswith("Value")` match patches the wrong line, so `asc.py` tokenises the
   attribute name.
@@ -231,15 +225,15 @@ into. Names starting with `_` are skipped, and objects can opt out with
 
 ```bat
 .venv\Scripts\activate
-python -m pytest                        REM 257 tests, ~40s
+python -m pytest                        REM 225 tests, ~40s
 python -m spice_mcp_app                 REM the desktop app; --folder fixtures --debug
 python -m spice_mcp_app --file fixtures\wrong_value_lowpass.asc   REM one circuit, pre-checked
 python -m spice_mcp_app.launch fixtures\wrong_value_lowpass.asc --no-ltspice
 python -m spice_mcp_server              REM stdio server; sits waiting for a client
 python scripts\install_context_menu.py  REM right-click verb; --status / --uninstall
-python scripts\list_tamu_models.py      REM needs TAMU_API_KEY
-python scripts\probe_tool_calling.py    REM 3-stage TAMU check; costs a few tokens
-python scripts\app_smoke.py             REM headless end-to-end, no window; costs tokens
+python scripts\list_bedrock_models.py   REM inference profiles + model access; free
+python scripts\probe_tool_calling.py    REM 3-stage Bedrock check; costs a few tokens
+python scripts\app_smoke.py             REM headless end-to-end, no window; costs money
 ```
 
 Prefix Python invocations with `PYTHONIOENCODING=utf-8` — LTspice output contains `Ω`, `µ`
@@ -247,7 +241,7 @@ and `°`, which crash a cp1252 console.
 
 `.mcp.json` registers the server so it can be driven from Claude Code directly.
 
-## State: Steps 0–8 plus the Explorer launcher; 257 tests pass
+## State: Steps 0–8, the Explorer launcher, and the Bedrock migration; 225 tests pass
 
 **Server half — `spice_mcp_server/`, seven tools**, all verified over a real MCP stdio
 handshake. It still knows nothing about LLMs.
@@ -266,8 +260,9 @@ Modules: `models.py` (pydantic schemas), `netlist.py`, `checks.py`, `logparse.py
 `ltspice.py` (staged invocation), `asc.py` (byte-preserving patcher), `diff.py`.
 
 **App half — `spice_mcp_app/`.** The only half that knows what an LLM is.
-`config.py` (env/`.env`, redacted logging), `session.py` (the spec'd log, atomic write per
-turn), `llm.py` (TAMU client, MCP→OpenAI schema translation, bounded agent loop),
+`config.py` (env/`.env`, region + model + credential *label*, no secret), `session.py` (the
+spec'd log, atomic write per turn), `llm.py` (Bedrock client, MCP→Anthropic tool mapping,
+bounded agent loop),
 `mcp_client.py` (stdio client holding one server subprocess open), `api.py` (JS bridge +
 **the approval gate**), `web/` (single-window UI), `__main__.py`, `launch.py` (the Explorer
 entry point). Plus `spice_mcp_launch.py` at the repo root — a one-line shim so the registry
@@ -294,15 +289,24 @@ starts with the cwd set to the user's circuit folder:
   against the cwd it would have scattered session logs into the user's source directory.
 - `mcp_client.py` passed `env=` as a **replacement** dict, so `LTSPICE_EXE` never reached the
   server despite `.env.example` documenting that it would. It now merges over `os.environ`
-  minus `_LLM_ONLY_ENV` — the key in particular has no business in a process that knows
-  nothing about LLMs. `tests/test_config.py` pins both.
+  minus the LLM-only variables — `SPICE_MCP_MODEL`, `SPICE_MCP_AWS_REGION`, and **everything
+  matching the `AWS_` prefix**. The prefix rule replaced an enumerated deny-list on purpose:
+  the chain keeps growing variables (`AWS_ROLE_ARN`, `AWS_WEB_IDENTITY_TOKEN_FILE`,
+  `AWS_CONTAINER_CREDENTIALS_*`, `AWS_BEARER_TOKEN_BEDROCK`) and the failure mode of missing
+  one is silent — the credential travels into a process that knows nothing about LLMs, and the
+  test still passes. `tests/test_config.py` pins both, and asserts the rule with a variable
+  named nowhere in `mcp_client.py`.
 
 ### Session log
 `./sessions/<uuid>.json`, flushed after every turn: `session_id`, `started_at`, `model`,
 `circuit_file`, `turns[]` (each `role`, `text`, optional `tool_calls`, `input_tokens`,
-`output_tokens`), `total_input_tokens`, `total_output_tokens`, `resolved`. `Turn.from_usage`
-is the **one** place `prompt_tokens`/`completion_tokens` are mapped to the spec's names, and
-it warns when an assistant turn arrives without usage.
+`output_tokens`), `total_input_tokens`, `total_output_tokens`, `resolved`. Bedrock's `usage`
+already uses `input_tokens`/`output_tokens`, so `Turn.from_usage` renames nothing — what it
+still does, and must keep doing, is **warn when an assistant turn arrives without usage**. It
+reads through `usage_value()` rather than converting `usage` to a dict up front, which is what
+keeps an absent count distinguishable from a zero and the warning reachable. Bedrock also
+sends `cache_read_input_tokens`/`cache_creation_input_tokens`; caching is off and the schema
+is fixed by the external comparison, so those are deliberately dropped.
 
 ### Testing philosophy — keep this
 `tests/test_checks.py` asserts the **exact set** of checks each fixture produces. Equality
@@ -314,8 +318,15 @@ Log-parser test samples are **real captured LTspice output**, never invented. Th
 are inconsistent enough that plausible-looking fabricated samples would test the wrong thing.
 
 The suite is offline and free: `tests/test_llm.py` drives the agent loop with a `FakeClient`
-returning canned OpenAI-shaped responses. Live-model checks live in `scripts/`, not in
-`pytest`, so running the tests never costs tokens or depends on the proxy being up.
+returning canned Messages-API responses. Live-model checks live in `scripts/`, not in
+`pytest`, so running the tests never costs money or depends on Bedrock being reachable.
+
+`tests/conftest.py`'s **autouse `isolated_aws_environment`** is what makes that true now that
+auth is IAM-based. It deletes every `AWS_*` and `SPICE_MCP_*` variable, points `HOME` and
+`USERPROFILE` at `tmp_path` so `~/.aws` cannot exist, and neuters `load_dotenv`. Without it
+the AWS chain succeeds from places no test mentions — ambient env, `~/.aws`, an SSO cache, an
+instance role — so a "credentials are missing" test would pass on a bare laptop and fail on a
+configured one, and a mis-wired test could reach the live API and spend money.
 
 ### Fixtures pull in different directions on purpose
 `no_dc_path.asc` is caught by the static check but **simulates fine** (exit 0, solves `.op`
@@ -324,14 +335,20 @@ to simulate. `wrong_value_lowpass.asc` passes both and is out of spec by 10× �
 *reasoning* catches it. `RCLP.asc` also simulates "successfully" despite `R1` dangling and
 `Vin` driving nothing. Neither pass subsumes the other; that's the argument for two stages.
 
-## Acceptance bar — met, except two items needing the user
+## Acceptance bar — met, except three items needing the user
 
 `scripts\app_smoke.py` drives the real `Api` headlessly through nine stages on a temp copy of
-`wrong_value_lowpass.asc` and passed end to end: diagnosis → **approval-gate probe** (the
-model is asked to write unilaterally; the gate refuses and the file stays byte-identical) →
-approval → byte fidelity → re-simulate → model confirmation → session-log audit
-(16 turns, 41 996 in / 1 572 out, schema keys exactly as specified, no null counts, totals
-matching).
+`wrong_value_lowpass.asc`: diagnosis → **approval-gate probe** (the model is asked to write
+unilaterally; the gate refuses and the file stays byte-identical) → approval → byte fidelity →
+re-simulate → model confirmation → session-log audit.
+
+It passed end to end **on the TAMU transport** (16 turns, 41 996 in / 1 572 out, schema keys
+exactly as specified, no null counts, totals matching). It has **not yet been re-run on
+Bedrock** — no AWS credentials exist on this machine — so that result no longer certifies the
+current transport. Re-running it is the first thing to do once credentials are available, in
+this order: `list_bedrock_models.py` (free) → `probe_tool_calling.py` (a few tokens) →
+`app_smoke.py`. Stages 4/5 are prompt- and model-sensitive and may need re-tuning against Opus
+5's phrasing; a re-tune is fine, **a refusal that does not happen is not**.
 
 - ✅ Byte fidelity on `patch_component_value` — only the intended line changes, encoding and
   line endings unchanged, and the patched file survives an LTspice `-netlist` round trip and
@@ -364,7 +381,7 @@ part that genuinely needs eyes.
 5. In LTspice: **File ▸ Revert** → `C1` shows the new value in the GUI. ← closes the GUI item.
 6. `python scripts\install_context_menu.py --uninstall` — the entry is gone.
 
-Automated up to that point: 257 tests, plus a headless launcher run verified to reach window
+Automated up to that point: 225 tests, plus a headless launcher run verified to reach window
 creation with `get_initial_folder()` returning the resolved folder and circuit, cwd back at
 the repo root, and nothing written beside the fixture.
 

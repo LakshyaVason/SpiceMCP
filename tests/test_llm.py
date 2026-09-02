@@ -1,9 +1,18 @@
 """Tests for the agent loop, schema translation, and the approval gate.
 
-All offline: `FakeClient` returns canned OpenAI-shaped responses. The loop's job is to
-keep asking until the model stops requesting tools, feed results back in the shape the
-provider expects, and record usage for every round - none of which needs a network to
-verify, and all of which would be expensive and flaky to test against the live proxy.
+All offline: `FakeClient` returns canned Messages-API responses. The loop's job is to keep
+asking until the model stops requesting tools, feed results back in the shape the API
+expects, and record usage for every round - none of which needs a network to verify, and
+all of which would be expensive and flaky to test against live Bedrock.
+
+The fakes are **objects, not dicts**, because that is what the SDK returns; `_block_field`
+tolerates both, and one test below covers the dict path deliberately.
+
+Several of these tests exist because of a specific failure. The transport was previously
+OpenAI-shaped and the model narrated its tool calls as plain prose instead of emitting
+tool_use blocks - so "a tool_use block is actually executed", "all results from one round
+go back in a single message", and "thinking blocks survive the round trip" are each
+guarding a way that can silently stop working again.
 
 The approval-gate tests are the important ones here. "Nothing touches disk before user
 approval" is a promise to the user about their schematic, and a model can ask for
@@ -19,26 +28,20 @@ route really behaves.
 
 from __future__ import annotations
 
-import json
-
+import anthropic
+import httpx2
 import pytest
 
 from spice_mcp_app.api import Api
-from spice_mcp_app.config import (
-    TOOL_MODE_NATIVE,
-    TOOL_MODE_PROMPTED_JSON,
-    Config,
-)
 from spice_mcp_app.llm import (
     DEFAULT_MAX_REPLY_TOKENS,
     MAX_PROTOCOL_CORRECTIONS,
     MAX_TOOL_ROUNDS,
+    SYSTEM_PROMPT,
+    BedrockClient,
     LLMError,
-    TamuClient,
-    ProtocolError,
-    mcp_tools_to_openai,
-    parse_prompted_reply,
-    prompted_protocol_prompt,
+    append_user_note,
+    mcp_tools_to_anthropic,
     run_agent_turn,
 )
 from spice_mcp_app.session import Session
@@ -53,29 +56,41 @@ class FakeTool:
         self.input_schema = input_schema
 
 
-def message(content=None, tool_calls=None):
-    payload: dict = {"role": "assistant", "content": content}
-    if tool_calls:
-        payload["tool_calls"] = [
-            {
-                "id": f"call_{i}",
-                "type": "function",
-                "function": {"name": name, "arguments": json.dumps(args)},
-            }
-            for i, (name, args) in enumerate(tool_calls)
-        ]
-    return payload
+class Block:
+    """A content block, shaped like the SDK's - attributes, not keys."""
+
+    def __init__(self, type, **fields):
+        self.type = type
+        for key, value in fields.items():
+            setattr(self, key, value)
 
 
-def response(msg, prompt_tokens=100, completion_tokens=20):
-    return {
-        "choices": [{"message": msg, "finish_reason": "stop"}],
-        "usage": {
-            "prompt_tokens": prompt_tokens,
-            "completion_tokens": completion_tokens,
-            "total_tokens": prompt_tokens + completion_tokens,
-        },
-    }
+class Usage:
+    def __init__(self, input_tokens=100, output_tokens=20):
+        self.input_tokens = input_tokens
+        self.output_tokens = output_tokens
+
+
+class Response:
+    def __init__(self, content, stop_reason="end_turn", input_tokens=100, output_tokens=20):
+        self.content = content
+        self.stop_reason = stop_reason
+        self.usage = Usage(input_tokens, output_tokens)
+
+
+def answer(text, **kwargs):
+    """A finished reply: text only, stop_reason end_turn."""
+    return Response([Block("text", text=text)], **kwargs)
+
+
+def wants_tools(text, tool_calls, **kwargs):
+    """A reply that asks for one or more tools, the way stop_reason "tool_use" arrives."""
+    content = [Block("text", text=text)] if text else []
+    content += [
+        Block("tool_use", id=f"toolu_{i}", name=name, input=args)
+        for i, (name, args) in enumerate(tool_calls)
+    ]
+    return Response(content, stop_reason="tool_use", **kwargs)
 
 
 class FakeClient:
@@ -84,9 +99,9 @@ class FakeClient:
         self.calls: list[dict] = []
         self.model = "fake-model"
 
-    def complete(self, messages, *, tools=None, max_tokens=None, stop=None):
+    def complete(self, messages, *, tools=None, system=SYSTEM_PROMPT, max_tokens=None):
         self.calls.append(
-            {"messages": [dict(m) for m in messages], "tools": tools, "stop": stop}
+            {"messages": [dict(m) for m in messages], "tools": tools, "system": system}
         )
         if not self._responses:
             raise AssertionError("the loop asked for more responses than were provided")
@@ -98,139 +113,51 @@ def session(tmp_path):
     return Session(model="fake-model", sessions_dir=tmp_path)
 
 
-# --- prompted-JSON helpers ------------------------------------------------------------
-
-PROMPTED_TOOLS = mcp_tools_to_openai(
-    [
-        FakeTool(
-            "read_netlist",
-            "Parse a circuit into structured JSON.",
-            {
-                "type": "object",
-                "properties": {"path": {"type": "string"}},
-                "required": ["path"],
-            },
-        ),
-        FakeTool(
-            "run_simulation",
-            "Run LTspice in batch mode.",
-            {"type": "object", "properties": {"path": {"type": "string"}}},
-        ),
-        FakeTool(
-            "patch_component_value",
-            "Change one component value.",
-            {"type": "object", "properties": {"asc_path": {"type": "string"}}},
-        ),
-    ]
-)
-
-
-def prompted(payload, **usage):
-    """A response whose content is one protocol JSON object, as the real model sends it."""
-    return response(message(json.dumps(payload)), **usage)
-
-
-def raw(content, **usage):
-    """A response whose content is whatever the model actually emitted."""
-    return response(message(content), **usage)
-
-
-def truncated(content, **usage):
-    """A reply the provider cut off at its output cap: `finish_reason: "length"`."""
-    body = raw(content, **usage)
-    body["choices"][0]["finish_reason"] = "length"
-    return body
-
-
-def run_prompted(client, session, text, **kwargs):
-    kwargs.setdefault("tools", PROMPTED_TOOLS)
-    return run_agent_turn(
-        client, session, text, tool_mode=TOOL_MODE_PROMPTED_JSON, **kwargs
-    )
-
-
-# --- the request payload --------------------------------------------------------------
-
-
-class FakeResponse:
-    status_code = 200
-    headers: dict[str, str] = {}
-    text = ""
-
-    def json(self):
-        return {"choices": [{"message": {"role": "assistant", "content": "hi"}}]}
-
-
-def test_every_request_pins_stream_false_and_an_output_ceiling(tmp_path):
-    """Two proxy defaults that quietly break things if left alone.
-
-    Streaming drops the `usage` block the session log is built on, and an omitted
-    `max_tokens` caps the reply at 1024 - short enough to cut a diagnosis in half.
-    """
-    config = Config(
-        api_key="not-a-real-key",
-        model="fake-model",
-        base_url="https://example.invalid/openai",
-        sessions_dir=tmp_path,
-    )
-    client = TamuClient(config)
-    sent: list[dict] = []
-    client._http.post = lambda url, **kw: sent.append(kw["json"]) or FakeResponse()
-
-    client.complete([{"role": "user", "content": "hi"}])
-
-    assert sent[0]["stream"] is False
-    assert sent[0]["max_tokens"] == DEFAULT_MAX_REPLY_TOKENS
-    # Nothing is sent that was not asked for.
-    assert "tools" not in sent[0]
-    assert "stop" not in sent[0]
+def tool_results(message):
+    """The tool_result blocks of a message the loop appended."""
+    return [b for b in message["content"] if b.get("type") == "tool_result"]
 
 
 # --- schema translation ---------------------------------------------------------------
 
 
-def test_mcp_tools_translate_to_openai_functions():
+def test_mcp_tools_translate_to_anthropic_tools():
+    """Barely a translation - which is the point. MCP already uses `input_schema`."""
     schema = {"type": "object", "properties": {"path": {"type": "string"}}}
-    translated = mcp_tools_to_openai([FakeTool("read_netlist", "Reads it.", schema)])
+    translated = mcp_tools_to_anthropic([FakeTool("read_netlist", "Reads it.", schema)])
 
     assert translated == [
         {
-            "type": "function",
-            "function": {
-                "name": "read_netlist",
-                "description": "Reads it.",
-                "parameters": schema,
-            },
+            "name": "read_netlist",
+            "description": "Reads it.",
+            "input_schema": schema,
         }
     ]
 
 
 def test_translation_accepts_camel_case_dicts():
     """Wire-format dicts use inputSchema; both spellings must work."""
-    translated = mcp_tools_to_openai(
+    translated = mcp_tools_to_anthropic(
         [{"name": "t", "description": "d", "inputSchema": {"type": "object"}}]
     )
-    assert translated[0]["function"]["parameters"] == {"type": "object"}
+    assert translated[0]["input_schema"] == {"type": "object"}
 
 
 def test_translation_substitutes_an_empty_schema():
-    """A null `parameters` is rejected by some providers."""
-    translated = mcp_tools_to_openai([FakeTool("no_args")])
-    assert translated[0]["function"]["parameters"] == {
-        "type": "object",
-        "properties": {},
-    }
+    """`input_schema` is required by the API, so a null one has to become an empty object."""
+    translated = mcp_tools_to_anthropic([FakeTool("no_args")])
+    assert translated[0]["input_schema"] == {"type": "object", "properties": {}}
 
 
 def test_translation_skips_nameless_tools():
-    assert mcp_tools_to_openai([{"description": "no name"}]) == []
+    assert mcp_tools_to_anthropic([{"description": "no name"}]) == []
 
 
 # --- the loop -------------------------------------------------------------------------
 
 
 def test_a_plain_answer_ends_the_loop(session):
-    client = FakeClient([response(message("It is a low-pass filter."))])
+    client = FakeClient([answer("It is a low-pass filter.")])
     result = run_agent_turn(client, session, "what is it?")
 
     assert result.text == "It is a low-pass filter."
@@ -239,22 +166,27 @@ def test_a_plain_answer_ends_the_loop(session):
     assert len(client.calls) == 1
 
 
-def test_the_system_prompt_is_prepended_once(session):
-    client = FakeClient([response(message("a")), response(message("b"))])
+def test_the_system_prompt_is_passed_out_of_band(session):
+    """The Messages API has no system *role*; it is a top-level parameter.
+
+    Leaving a `{"role": "system"}` message in the history would be rejected outright, and
+    sending the prompt on only the first round would quietly drop it mid-conversation.
+    """
+    client = FakeClient([answer("a"), answer("b")])
     history: list[dict] = []
 
     run_agent_turn(client, session, "first", history=history)
     run_agent_turn(client, session, "second", history=history)
 
-    assert history[0]["role"] == "system"
-    assert sum(1 for m in history if m["role"] == "system") == 1
+    assert [c["system"] for c in client.calls] == [SYSTEM_PROMPT, SYSTEM_PROMPT]
+    assert not any(m["role"] == "system" for m in history)
 
 
 def test_tool_results_are_fed_back_and_the_loop_continues(session):
     client = FakeClient(
         [
-            response(message("Looking.", [("read_netlist", {"path": "x.asc"})])),
-            response(message("R1 is 1.6k.")),
+            wants_tools("Looking.", [("read_netlist", {"path": "x.asc"})]),
+            answer("R1 is 1.6k."),
         ]
     )
     executed: list[tuple[str, dict]] = []
@@ -264,32 +196,70 @@ def test_tool_results_are_fed_back_and_the_loop_continues(session):
         return '{"components": []}'
 
     result = run_agent_turn(
-        client, session, "read it", tool_executor=executor, tools=[{"x": 1}]
+        client, session, "read it", tool_executor=executor, tools=[{"name": "x"}]
     )
 
     assert executed == [("read_netlist", {"path": "x.asc"})]
     assert result.rounds == 2
     assert result.text == "R1 is 1.6k."
 
-    # The second request must carry the assistant message and a matching tool result.
+    # The second request must carry the assistant turn and a matching tool_result, keyed
+    # by tool_use_id - a mismatched or missing id is rejected by the API.
     second = client.calls[1]["messages"]
     assert second[-2]["role"] == "assistant"
-    assert second[-1] == {
-        "role": "tool",
-        "tool_call_id": "call_0",
-        "content": '{"components": []}',
-    }
+    assert second[-1]["role"] == "user"
+    assert tool_results(second[-1]) == [
+        {
+            "type": "tool_result",
+            "tool_use_id": "toolu_0",
+            "content": '{"components": []}',
+            "is_error": False,
+        }
+    ]
+
+
+def test_the_assistant_turn_is_handed_back_verbatim(session):
+    """The tool_use blocks must return unchanged, or the results cannot be matched up."""
+    asked = wants_tools("Looking.", [("read_netlist", {"path": "x.asc"})])
+    client = FakeClient([asked, answer("done")])
+
+    run_agent_turn(
+        client, session, "go", tool_executor=lambda n, a: "{}", tools=[{"name": "x"}]
+    )
+
+    assert client.calls[1]["messages"][-2]["content"] is asked.content
+
+
+def test_all_results_from_one_round_go_back_in_one_message(session):
+    """Parallel tool_use blocks must not be answered across separate messages."""
+    client = FakeClient(
+        [
+            wants_tools(
+                "Both, please.",
+                [("read_netlist", {"path": "x.asc"}), ("check_netlist_static", {"path": "x.asc"})],
+            ),
+            answer("done"),
+        ]
+    )
+    result = run_agent_turn(
+        client, session, "go", tool_executor=lambda n, a: f"result of {n}", tools=[{"name": "x"}]
+    )
+
+    assert [r.name for r in result.tool_calls] == ["read_netlist", "check_netlist_static"]
+    sent = client.calls[1]["messages"]
+    assert sum(1 for m in sent if m["role"] == "user") == 2  # the question, then one result turn
+    assert [b["tool_use_id"] for b in tool_results(sent[-1])] == ["toolu_0", "toolu_1"]
 
 
 def test_usage_is_summed_across_rounds(session):
     client = FakeClient(
         [
-            response(message("t", [("read_netlist", {})]), 100, 20),
-            response(message("done"), 300, 50),
+            wants_tools("t", [("read_netlist", {})], input_tokens=100, output_tokens=20),
+            answer("done", input_tokens=300, output_tokens=50),
         ]
     )
     result = run_agent_turn(
-        client, session, "go", tool_executor=lambda n, a: "{}", tools=[{}]
+        client, session, "go", tool_executor=lambda n, a: "{}", tools=[{"name": "x"}]
     )
 
     assert result.input_tokens == 400
@@ -306,48 +276,61 @@ def test_a_failing_tool_is_reported_to_the_model_not_raised(session):
 
     client = FakeClient(
         [
-            response(message("t", [("read_netlist", {"path": "nope.asc"})])),
-            response(message("That file does not exist.")),
+            wants_tools("t", [("read_netlist", {"path": "nope.asc"})]),
+            answer("That file does not exist."),
         ]
     )
     result = run_agent_turn(
-        client, session, "read nope.asc", tool_executor=executor, tools=[{}]
+        client, session, "read nope.asc", tool_executor=executor, tools=[{"name": "x"}]
     )
 
     assert result.rounds == 2
     assert result.tool_calls[0].is_error
     assert "No such file" in result.tool_calls[0].result
-    assert "No such file" in client.calls[1]["messages"][-1]["content"]
+
+    sent_back = tool_results(client.calls[1]["messages"][-1])[0]
+    assert "No such file" in sent_back["content"]
+    assert sent_back["is_error"] is True
 
 
-def test_malformed_tool_arguments_are_handed_back(session):
-    broken = {
-        "role": "assistant",
-        "content": None,
-        "tool_calls": [
-            {
-                "id": "call_0",
-                "type": "function",
-                "function": {"name": "read_netlist", "arguments": "{not json"},
-            }
-        ],
-    }
-    client = FakeClient([response(broken), response(message("Sorry, retrying."))])
+def test_a_non_object_tool_input_is_handed_back(session):
+    """The API parses tool input for us, so this should be impossible.
+
+    It is checked anyway because of where a non-dict would end up: `api.py`'s approval gate
+    reads `arguments.get("apply")`, and on a non-dict that check cannot fire - the gate
+    would fail *open* and an unapproved write would reach the schematic.
+    """
+    called: list[str] = []
+    client = FakeClient(
+        [
+            Response(
+                [Block("tool_use", id="toolu_0", name="read_netlist", input="x.asc")],
+                stop_reason="tool_use",
+            ),
+            answer("Sorry, retrying."),
+        ]
+    )
     result = run_agent_turn(
-        client, session, "go", tool_executor=lambda n, a: "{}", tools=[{}]
+        client,
+        session,
+        "go",
+        tool_executor=lambda n, a: called.append(n) or "{}",
+        tools=[{"name": "x"}],
     )
 
+    assert called == [], "a non-dict input reached the tool executor"
     assert result.tool_calls[0].is_error
-    assert "not valid JSON" in result.tool_calls[0].result
+    assert result.tool_calls[0].arguments == {}
+    assert "not an object" in result.tool_calls[0].result
 
 
 def test_the_loop_is_bounded(session):
     """A model that never stops asking for tools must not run forever."""
     client = FakeClient(
-        [response(message("again", [("read_netlist", {})]))] * (MAX_TOOL_ROUNDS + 2)
+        [wants_tools("again", [("read_netlist", {})])] * (MAX_TOOL_ROUNDS + 2)
     )
     result = run_agent_turn(
-        client, session, "go", tool_executor=lambda n, a: "{}", tools=[{}]
+        client, session, "go", tool_executor=lambda n, a: "{}", tools=[{"name": "x"}]
     )
 
     assert result.rounds == MAX_TOOL_ROUNDS
@@ -357,32 +340,70 @@ def test_the_loop_is_bounded(session):
 
 
 def test_tool_calls_without_an_executor_do_not_crash(session):
-    client = FakeClient(
-        [response(message("t", [("read_netlist", {})])), response(message("ok"))]
-    )
-    result = run_agent_turn(client, session, "go", tools=[{}])
+    client = FakeClient([wants_tools("t", [("read_netlist", {})]), answer("ok")])
+    result = run_agent_turn(client, session, "go", tools=[{"name": "x"}])
     assert result.tool_calls[0].is_error
     assert "No tools are available" in result.tool_calls[0].result
 
 
-def test_content_part_lists_are_flattened(session):
-    """Some providers return content as a list of typed parts rather than a string."""
-    msg = {
-        "role": "assistant",
+def test_thinking_blocks_are_returned_to_the_api_but_not_to_the_user(session):
+    """Thinking is on by default on Opus 5, so this is the normal case, not an edge one.
+
+    The API requires thinking blocks back unchanged alongside a tool_use from the same turn,
+    and the user must not be shown the model's scratch work as if it were the answer.
+    """
+    thinking = Block("thinking", thinking="Let me check R1.", signature="sig")
+    client = FakeClient(
+        [
+            Response(
+                [thinking, Block("text", text="Looking."),
+                 Block("tool_use", id="toolu_0", name="read_netlist", input={})],
+                stop_reason="tool_use",
+            ),
+            answer("R1 is 1.6k."),
+        ]
+    )
+    history: list[dict] = []
+    result = run_agent_turn(
+        client,
+        session,
+        "go",
+        tool_executor=lambda n, a: "{}",
+        tools=[{"name": "x"}],
+        history=history,
+    )
+
+    assert "Let me check" not in result.text
+    assert thinking in history[1]["content"]
+
+
+def test_a_truncated_answer_says_so(session):
+    """max_tokens must not be presented as a finished diagnosis."""
+    result = run_agent_turn(
+        FakeClient([answer("The cutoff is", stop_reason="max_tokens")]), session, "go"
+    )
+    assert "incomplete" in result.text
+
+
+def test_response_dicts_are_handled_as_well_as_objects(session):
+    """The SDK returns objects, but a dict must not break the loop."""
+    plain = {
         "content": [{"type": "text", "text": "Part one. "}, {"type": "text", "text": "Part two."}],
+        "stop_reason": "end_turn",
+        "usage": {"input_tokens": 5, "output_tokens": 2},
     }
-    result = run_agent_turn(FakeClient([response(msg)]), session, "go")
+    result = run_agent_turn(FakeClient([plain]), session, "go")
     assert result.text == "Part one. Part two."
+    assert result.input_tokens == 5
 
 
 def test_session_records_the_tool_turns(session):
     client = FakeClient(
-        [
-            response(message("t", [("read_netlist", {"path": "x"})])),
-            response(message("done")),
-        ]
+        [wants_tools("t", [("read_netlist", {"path": "x"})]), answer("done")]
     )
-    run_agent_turn(client, session, "go", tool_executor=lambda n, a: "RESULT", tools=[{}])
+    run_agent_turn(
+        client, session, "go", tool_executor=lambda n, a: "RESULT", tools=[{"name": "x"}]
+    )
 
     roles = [t.role for t in session.turns]
     assert roles == ["user", "assistant", "tool", "assistant"]
@@ -390,685 +411,173 @@ def test_session_records_the_tool_turns(session):
     assert session.turns[2].text == "RESULT"
 
 
-# --- native mode, stated explicitly ----------------------------------------------------
+# --- history shape --------------------------------------------------------------------
 
 
-def test_native_mode_sends_the_tools_array_and_consumes_tool_calls(session):
-    """The pre-existing behaviour, now that it is one mode of two rather than the only one."""
-    client = FakeClient(
-        [
-            response(message("Looking.", [("read_netlist", {"path": "x.asc"})])),
-            response(message("It is a low-pass.")),
-        ]
-    )
-    executed: list[tuple[str, dict]] = []
+def test_notes_never_produce_two_user_turns_in_a_row(session):
+    """The API rejects consecutive same-role messages; the app appends notes freely.
 
-    result = run_agent_turn(
-        client,
-        session,
-        "what is it?",
-        tools=PROMPTED_TOOLS,
-        tool_executor=lambda n, a: executed.append((n, a)) or '{"components": []}',
-        tool_mode=TOOL_MODE_NATIVE,
-    )
-
-    assert executed == [("read_netlist", {"path": "x.asc"})]
-    assert result.text == "It is a low-pass."
-    # Native mode's whole premise: the tool catalogue travels in the API field.
-    assert client.calls[0]["tools"] == PROMPTED_TOOLS
-    assert "TOOL PROTOCOL" not in client.calls[0]["messages"][0]["content"]
-
-
-def test_the_default_mode_is_native(session):
-    client = FakeClient([response(message("hi"))])
-    run_agent_turn(client, session, "go", tools=PROMPTED_TOOLS)
-    assert client.calls[0]["tools"] == PROMPTED_TOOLS
-
-
-def test_an_unknown_mode_is_rejected_rather_than_defaulted(session):
-    with pytest.raises(LLMError, match="Unknown tool mode"):
-        run_agent_turn(
-            FakeClient([]), session, "go", tool_mode="prompted-json"  # hyphen, not underscore
-        )
-
-
-# --- prompted-JSON mode ----------------------------------------------------------------
-#
-# This is the mode that had to be added, and these are the tests that would have caught
-# the production failure. The fake here never returns `tool_calls`, because the route this
-# mode exists for never does.
-
-
-def test_the_protocol_prompt_lists_the_real_tools_and_schemas():
-    prompt = prompted_protocol_prompt(PROMPTED_TOOLS)
-
-    assert "read_netlist" in prompt and "run_simulation" in prompt
-    assert '"required":["path"]' in prompt, "the argument schema must reach the model"
-    assert '{"type":"tool_call"' in prompt and '{"type":"answer"' in prompt
-    # Compact on purpose: this text is re-sent on every round of every turn.
-    assert '"properties": {' not in prompt, "the schema was pretty-printed"
-
-
-def test_a_prompted_tool_request_reaches_the_executor_and_its_result_reaches_the_model(
-    session,
-):
-    """The end-to-end shape of the fix: JSON request -> real executor -> real result back."""
-    client = FakeClient(
-        [
-            prompted(
-                {
-                    "type": "tool_call",
-                    "name": "read_netlist",
-                    "arguments": {"path": r"C:\c\rc.asc"},
-                }
-            ),
-            prompted({"type": "answer", "text": "C1 is 1n, so the cutoff is 10 kHz."}),
-        ]
-    )
-    executed: list[tuple[str, dict]] = []
-
-    def executor(name, arguments):
-        executed.append((name, arguments))
-        return '{"components": [{"ref": "C1", "value": "1n"}]}'
-
-    result = run_prompted(client, session, "what is wrong?", tool_executor=executor)
-
-    assert executed == [("read_netlist", {"path": r"C:\c\rc.asc"})]
-    assert result.text == "C1 is 1n, so the cutoff is 10 kHz."
-    assert result.rounds == 2
-    assert result.protocol_errors == 0
-
-    # The API field is not used in this mode - the catalogue is in the system prompt.
-    assert client.calls[0]["tools"] is None
-    assert "TOOL PROTOCOL" in client.calls[0]["messages"][0]["content"]
-    # And generation is stopped at the label, so a model that starts role-playing the
-    # tool result is cut off rather than billed for it.
-    assert client.calls[0]["stop"] == ["TOOL RESULT"]
-
-    # The second request must carry the model's own JSON and the real tool result,
-    # labelled so the model cannot mistake its own text for tool output.
-    second = client.calls[1]["messages"]
-    assert second[-2]["role"] == "assistant"
-    assert second[-1]["role"] == "user"
-    assert second[-1]["content"].startswith("TOOL RESULT\nname: read_netlist\nresult:")
-    assert '"value": "1n"' in second[-1]["content"], (
-        "the model was not given the actual result the executor returned"
-    )
-
-
-def test_prompted_mode_records_the_turns_and_the_tool_result(session):
-    client = FakeClient(
-        [
-            prompted({"type": "tool_call", "name": "read_netlist", "arguments": {"path": "x"}}),
-            prompted({"type": "answer", "text": "done"}),
-        ]
-    )
-    run_prompted(client, session, "go", tool_executor=lambda n, a: "REAL RESULT")
-
-    roles = [t.role for t in session.turns]
-    assert roles == ["user", "assistant", "tool", "assistant"]
-    assert session.turns[1].tool_calls[0]["name"] == "read_netlist"
-    assert session.turns[2].text == "REAL RESULT"
-
-
-def test_several_prompted_rounds_accumulate_every_api_response(session):
-    """Four API calls, four usage blocks. The cost comparison depends on all of them."""
-    client = FakeClient(
-        [
-            prompted(
-                {"type": "tool_call", "name": "read_netlist", "arguments": {"path": "x"}},
-                prompt_tokens=1000,
-                completion_tokens=30,
-            ),
-            prompted(
-                {"type": "tool_call", "name": "run_simulation", "arguments": {"path": "x"}},
-                prompt_tokens=2000,
-                completion_tokens=40,
-            ),
-            prompted(
-                {
-                    "type": "tool_call",
-                    "name": "patch_component_value",
-                    "arguments": {"asc_path": "x"},
-                },
-                prompt_tokens=3000,
-                completion_tokens=50,
-            ),
-            prompted(
-                {"type": "answer", "text": "C1 should be 100n."},
-                prompt_tokens=4000,
-                completion_tokens=60,
-            ),
-        ]
-    )
-    executed: list[str] = []
-
-    result = run_prompted(
-        client,
-        session,
-        "diagnose it",
-        tool_executor=lambda n, a: executed.append(n) or "{}",
-    )
-
-    assert executed == ["read_netlist", "run_simulation", "patch_component_value"]
-    assert result.rounds == 4
-    assert result.input_tokens == 10_000
-    assert result.output_tokens == 180
-    assert session.total_input_tokens == 10_000
-    assert session.total_output_tokens == 180
-
-
-def test_a_fenced_json_reply_is_accepted(session):
-    """A markdown fence is the one habit worth tolerating; it must not break the app."""
-    body = json.dumps({"type": "tool_call", "name": "read_netlist", "arguments": {"path": "x"}})
-    client = FakeClient(
-        [
-            raw(f"```json\n{body}\n```"),
-            raw("```\n" + json.dumps({"type": "answer", "text": "fenced answer"}) + "\n```"),
-        ]
-    )
-    executed: list[str] = []
-
-    result = run_prompted(
-        client, session, "go", tool_executor=lambda n, a: executed.append(n) or "{}"
-    )
-
-    assert executed == ["read_netlist"]
-    assert result.text == "fenced answer"
-    assert result.protocol_errors == 0
-
-
-def test_malformed_json_executes_nothing_and_earns_one_correction(session):
-    client = FakeClient(
-        [
-            raw("Sure! Here is what I think: the capacitor looks wrong."),
-            prompted({"type": "answer", "text": "C1 is wrong."}),
-        ]
-    )
-    executed: list[str] = []
-
-    result = run_prompted(
-        client, session, "go", tool_executor=lambda n, a: executed.append(n) or "{}"
-    )
-
-    assert executed == [], "prose was executed as if it were a tool call"
-    assert result.protocol_errors == 1
-    assert result.text == "C1 is wrong."
-    correction = client.calls[1]["messages"][-1]
-    assert correction["role"] == "user"
-    assert correction["content"].startswith("PROTOCOL ERROR")
-    assert "Nothing was run" in correction["content"]
-
-
-def test_a_reply_cut_off_by_the_length_limit_is_diagnosed_as_such(session):
-    """Seen live: a long answer stopped at exactly 1024 completion tokens, mid-string.
-
-    The JSON was fine until the cap; telling the model it wrote invalid JSON sends it
-    hunting for a syntax error it never made. It is told to be shorter instead.
+    `select_circuit` and `apply_patch` both add a user-role note, and then the user's next
+    question adds another. Under the old transport that was tolerated. Here it is a 400,
+    so the note has to fold into the pending turn.
     """
-    client = FakeClient(
-        [
-            truncated('{"type":"answer","text":"Circuit as read from the netlist:\\n\\n  R1'),
-            prompted({"type": "answer", "text": "R1 is 8.2k."}),
-        ]
+    history: list[dict] = []
+    append_user_note(history, "[circuit opened]")
+    append_user_note(history, "[fix applied]")
+
+    client = FakeClient([answer("ok")])
+    run_agent_turn(client, session, "why no gain?", history=history)
+
+    roles = [m["role"] for m in client.calls[0]["messages"]]
+    assert roles == ["user"]
+    sent = client.calls[0]["messages"][0]["content"]
+    assert "[circuit opened]" in sent and "[fix applied]" in sent and "why no gain?" in sent
+    assert not any(
+        a["role"] == b["role"] for a, b in zip(history, history[1:])
+    ), f"consecutive same-role turns: {[m['role'] for m in history]}"
+
+
+def test_a_note_folds_into_a_pending_block_list_too():
+    """After a tool round the trailing user turn holds blocks, not a string."""
+    history = [{"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t"}]}]
+    append_user_note(history, "[fix applied]")
+
+    assert len(history) == 1
+    assert history[0]["content"][-1] == {"type": "text", "text": "[fix applied]"}
+
+
+# --- error translation ----------------------------------------------------------------
+
+
+def _bedrock_client_raising(exc, fake_config):
+    """A BedrockClient whose transport raises, without constructing a real one."""
+    client = object.__new__(BedrockClient)
+    client._config = fake_config
+
+    class Boom:
+        class messages:
+            @staticmethod
+            def create(**kwargs):
+                raise exc
+
+    client._client = Boom()
+    return client
+
+
+def test_an_unavailable_model_says_which_region_and_what_to_do(fake_config):
+    """The most likely first-run failure, and the SDK's own message does not explain it."""
+    response = httpx2.Response(
+        404, request=httpx2.Request("POST", "https://bedrock.invalid/x")
     )
-    executed: list[str] = []
-
-    result = run_prompted(
-        client, session, "go", tool_executor=lambda n, a: executed.append(n) or "{}"
-    )
-
-    assert executed == []
-    assert result.protocol_errors == 1
-    assert result.text == "R1 is 8.2k."
-    correction = client.calls[1]["messages"][-1]["content"]
-    assert "output length limit" in correction
-    assert "shorter" in correction
-    # The generic "your JSON is invalid" advice would be a misdiagnosis here.
-    assert "Nothing was run" not in correction
-    # The truncated round was still billed, so it is still logged.
-    assert session.total_input_tokens == 200
-
-
-def test_persistent_protocol_failure_fails_safely_without_executing(session):
-    """Bounded: a model that cannot produce the protocol twice is not asked a third time."""
-    client = FakeClient([raw("still not JSON")] * (MAX_TOOL_ROUNDS + 2))
-    executed: list[str] = []
-
-    result = run_prompted(
-        client, session, "go", tool_executor=lambda n, a: executed.append(n) or "{}"
-    )
-
-    assert executed == []
-    assert result.protocol_errors == MAX_PROTOCOL_CORRECTIONS
-    assert len(client.calls) == MAX_PROTOCOL_CORRECTIONS
-    # The model's own words are handed back rather than an exception or an empty screen.
-    assert result.text == "still not JSON"
-    # Both billed rounds are still in the log.
-    assert session.total_input_tokens == 200
-
-
-def test_antml_invoke_markup_is_never_executed(session):
-    """Seen once in a real reply. It is not a protocol, and must not be treated as one.
-
-    A tolerant parser that went looking for a tool name in arbitrary markup would be
-    executing something the model never asked for through this app's protocol - with the
-    argument values taken from text nobody validated.
-    """
-    # Assembled from parts so the literal tags never appear in this file either - the
-    # point is what the parser does with them, not that they exist anywhere on disk.
-    invoke, param = "antml:invoke", "antml:parameter"
-    markup = (
-        f'<{invoke} name="read_netlist">'
-        f'<{param} name="path">C:\\somewhere\\else.asc</{param}>'
-        f"</{invoke}>"
-    )
-    client = FakeClient(
-        [raw(markup), prompted({"type": "answer", "text": "sorry about that"})]
-    )
-    executed: list[tuple[str, dict]] = []
-
-    result = run_prompted(
-        client,
-        session,
-        "go",
-        tool_executor=lambda n, a: executed.append((n, a)) or "{}",
+    client = _bedrock_client_raising(
+        anthropic.NotFoundError("no such model", response=response, body=None), fake_config
     )
 
-    assert executed == [], "tag markup was interpreted as a tool call"
-    assert result.protocol_errors == 1
-    assert result.text == "sorry about that"
+    with pytest.raises(LLMError) as caught:
+        client.complete([{"role": "user", "content": "hi"}])
+
+    assert "us-east-1" in str(caught.value)
+    assert "fake-model" in str(caught.value)
+    assert "list_bedrock_models" in str(caught.value)
 
 
-def test_an_unknown_tool_name_is_never_executed(session):
-    client = FakeClient(
-        [
-            prompted(
-                {
-                    "type": "tool_call",
-                    "name": "delete_everything",
-                    "arguments": {"path": "x"},
-                }
-            ),
-            prompted({"type": "answer", "text": "understood"}),
-        ]
-    )
-    executed: list[str] = []
+def test_a_botocore_failure_becomes_an_llm_error(fake_config):
+    """Credential resolution and SigV4 signing raise before the anthropic layer sees it."""
+    client = _bedrock_client_raising(RuntimeError("Unable to locate credentials"), fake_config)
 
-    result = run_prompted(
-        client, session, "go", tool_executor=lambda n, a: executed.append(n) or "{}"
-    )
+    with pytest.raises(LLMError) as caught:
+        client.complete([{"role": "user", "content": "hi"}])
 
-    assert executed == [], "an unknown tool name reached the executor"
-    assert result.text == "understood"
-    # Recorded as a rejection, so the attempt is visible in the UI and the session log.
-    assert [(c.name, c.is_error) for c in result.tool_calls] == [
-        ("delete_everything", True)
-    ]
-    assert "no tool called 'delete_everything'" in result.tool_calls[0].result
-    # And the correction tells it what does exist, rather than just "no".
-    assert "read_netlist" in client.calls[1]["messages"][-1]["content"]
+    assert "Unable to locate credentials" in str(caught.value)
 
 
-def test_arguments_that_are_not_an_object_are_not_executed(session):
-    client = FakeClient(
-        [
-            prompted(
-                {"type": "tool_call", "name": "read_netlist", "arguments": "C:\\rc.asc"}
-            ),
-            prompted({"type": "answer", "text": "fixed my JSON"}),
-        ]
-    )
-    executed: list[str] = []
-
-    run_prompted(
-        client, session, "go", tool_executor=lambda n, a: executed.append(n) or "{}"
-    )
-    assert executed == []
-
-
-def test_prompted_mode_without_an_executor_does_not_crash(session):
-    client = FakeClient(
-        [
-            prompted({"type": "tool_call", "name": "read_netlist", "arguments": {}}),
-            prompted({"type": "answer", "text": "ok"}),
-        ]
-    )
-    result = run_prompted(client, session, "go")
-    assert result.tool_calls[0].is_error
-    assert "No tools are available" in result.tool_calls[0].result
-
-
-def test_the_prompted_loop_is_bounded(session):
-    client = FakeClient(
-        [prompted({"type": "tool_call", "name": "read_netlist", "arguments": {}})]
-        * (MAX_TOOL_ROUNDS + 2)
-    )
-    result = run_prompted(client, session, "go", tool_executor=lambda n, a: "{}")
-
-    assert result.rounds == MAX_TOOL_ROUNDS
-    assert "Stopped after" in result.text
-    assert session.total_input_tokens > 0
-
-
-# --- the protocol parser in isolation --------------------------------------------------
-
-
-@pytest.mark.parametrize(
-    "text",
-    [
-        "",
-        "not json at all",
-        "[1, 2, 3]",
-        '{"type": "something_else"}',
-        '{"type": "answer"}',
-        '{"type": "answer", "text": {"nested": "object"}}',
-        '{"type": "tool_call", "arguments": {}}',
-        '{"type": "tool_call", "name": "", "arguments": {}}',
-        '{"type": "tool_call", "name": "read_netlist", "arguments": []}',
-        '{"type": "tool_call", "name": "nope", "arguments": {}}',
-        # The reply must *begin* with the object. Hunting through prose for something
-        # brace-shaped is how you execute a call the model never made.
-        'Here you go: {"type": "tool_call", "name": "read_netlist", "arguments": {}}',
-        '<invoke name="read_netlist">{"path": "x"}',
-    ],
-)
-def test_the_parser_refuses_anything_that_is_not_the_protocol(text):
-    with pytest.raises(ProtocolError):
-        parse_prompted_reply(text, known_tools=["read_netlist"])
-
-
-def test_a_fabricated_tool_result_after_the_request_is_discarded():
-    """The live failure this mode had to survive, reduced to its shape.
-
-    us.anthropic.claude-opus-5's first prompted reply was a correct tool_call followed by
-    a "TOOL RESULT" it wrote itself, with invented component values, and an answer quoting
-    them. Only the first object may be used: the real tool then runs and the real result
-    is what comes back. Nothing the model invented can reach the user as fact.
-    """
-    reply = (
-        '{"type":"tool_call","name":"read_netlist","arguments":{"path":"x"}}\n\n'
-        'TOOL RESULT {"ref":"C1","value":"100 nF"}\n\n'
-        '{"type":"answer","text":"C1 is 100 nF."}'
-    )
-    assert parse_prompted_reply(reply, known_tools=["read_netlist"]) == {
-        "type": "tool_call",
-        "name": "read_netlist",
-        "arguments": {"path": "x"},
-    }
-
-
-@pytest.mark.parametrize(
-    "text",
-    [
-        '{"type": "tool_call", "name": "read_netlist", "arguments": {"path": "x"}}',
-        '  {"type":"tool_call","name":"read_netlist","arguments":{"path":"x"}}\n',
-        '```json\n{"type": "tool_call", "name": "read_netlist", "arguments": {"path": "x"}}\n```',
-        '```\n{"type": "tool_call", "name": "read_netlist", "arguments": {"path": "x"}}\n```',
-    ],
-)
-def test_the_parser_accepts_the_protocol_with_or_without_a_fence(text):
-    assert parse_prompted_reply(text, known_tools=["read_netlist"]) == {
-        "type": "tool_call",
-        "name": "read_netlist",
-        "arguments": {"path": "x"},
-    }
-
-
-def test_missing_arguments_are_treated_as_none_given():
-    """Several tools have no required arguments; omitting the key is not an error."""
-    assert parse_prompted_reply(
-        '{"type": "tool_call", "name": "read_netlist"}', known_tools=["read_netlist"]
-    ) == {"type": "tool_call", "name": "read_netlist", "arguments": {}}
-
-
-def test_a_rejected_tool_name_is_reported_on_the_error():
-    with pytest.raises(ProtocolError) as caught:
-        parse_prompted_reply(
-            '{"type": "tool_call", "name": "rm_rf", "arguments": {}}',
-            known_tools=["read_netlist"],
-        )
-    assert caught.value.requested_name == "rm_rf"
+def test_llm_error_is_the_type_the_ui_catches():
+    assert issubclass(LLMError, RuntimeError)
 
 
 # --- the approval gate ----------------------------------------------------------------
 
 
-class FakeMCP:
-    def __init__(self):
-        self.calls: list[tuple[str, dict]] = []
-
-    def call_tool(self, name, arguments, timeout=300.0):
-        self.calls.append((name, arguments))
-        return json.dumps({"applied": bool(arguments.get("apply")), "summary": "ok"})
-
-
-def build_gated_api(tmp_path, tool_mode=TOOL_MODE_NATIVE):
-    config = Config(
-        api_key="not-a-real-key",
-        model="fake-model",
-        base_url="https://example.invalid/openai",
-        sessions_dir=tmp_path,
-        tool_mode=tool_mode,
-    )
-    api = Api(config=config)
-    api._mcp = FakeMCP()
-    api._session = Session(model="fake-model", sessions_dir=tmp_path)
-    return api
-
-
-@pytest.fixture
-def gated_api(tmp_path):
-    return build_gated_api(tmp_path)
-
-
-def test_an_unapproved_apply_is_refused(gated_api, tmp_path):
+def test_an_unapproved_apply_is_refused(api, tmp_path):
     asc = tmp_path / "c.asc"
     asc.write_text("Version 4.1\n", encoding="utf-8")
 
-    result = gated_api._tool_executor(
+    result = api._tool_executor(
         "patch_component_value",
         {"asc_path": str(asc), "ref": "C1", "new_value": "100n", "apply": True},
     )
 
     assert "REFUSED" in result
-    assert gated_api._mcp.calls == [], "the write reached the server despite the gate"
+    assert api._mcp.calls == [], "the write reached the server despite the gate"
 
 
-def test_a_preview_is_always_allowed(gated_api, tmp_path):
+def test_a_preview_is_always_allowed(api, tmp_path):
     asc = tmp_path / "c.asc"
     asc.write_text("Version 4.1\n", encoding="utf-8")
 
-    gated_api._tool_executor(
+    api._tool_executor(
         "patch_component_value",
         {"asc_path": str(asc), "ref": "C1", "new_value": "100n", "apply": False},
     )
 
-    assert len(gated_api._mcp.calls) == 1
-    assert gated_api._mcp.calls[0][1]["apply"] is False
+    assert len(api._mcp.calls) == 1
+    assert api._mcp.calls[0][1]["apply"] is False
 
 
-def test_approval_is_single_use(gated_api, tmp_path):
+def test_approval_is_single_use(api, tmp_path):
     """One approval, one write; a later apply must be approved again."""
     asc = tmp_path / "c.asc"
     asc.write_text("Version 4.1\n", encoding="utf-8")
 
-    approved = gated_api.apply_patch(str(asc), "C1", "100n")
+    approved = api.apply_patch(str(asc), "C1", "100n")
     assert approved["ok"], approved.get("error")
-    assert gated_api._mcp.calls[-1][1]["apply"] is True
+    assert api._mcp.calls[-1][1]["apply"] is True
 
     # The model trying to repeat it afterwards is refused.
-    again = gated_api._tool_executor(
+    again = api._tool_executor(
         "patch_component_value",
         {"asc_path": str(asc), "ref": "C1", "new_value": "100n", "apply": True},
     )
     assert "REFUSED" in again
 
 
-def test_approval_does_not_authorise_a_different_change(gated_api, tmp_path):
+def test_approval_does_not_authorise_a_different_change(api, tmp_path):
     """An approval is for one component and one value, not a licence to write."""
     asc = tmp_path / "c.asc"
     asc.write_text("Version 4.1\n", encoding="utf-8")
-    gated_api._approved.add((str(asc.resolve()), "C1", "100n"))
+    api._approved.add((str(asc.resolve()), "C1", "100n"))
 
     for arguments in (
         {"asc_path": str(asc), "ref": "R1", "new_value": "100n", "apply": True},
         {"asc_path": str(asc), "ref": "C1", "new_value": "10n", "apply": True},
     ):
-        assert "REFUSED" in gated_api._tool_executor("patch_component_value", arguments)
+        assert "REFUSED" in api._tool_executor("patch_component_value", arguments)
 
 
-def test_applying_tells_the_model_what_happened(gated_api, tmp_path):
+def test_applying_tells_the_model_what_happened(api, tmp_path):
     """The conversation must stay truthful about the state of the file."""
     asc = tmp_path / "c.asc"
     asc.write_text("Version 4.1\n", encoding="utf-8")
 
-    gated_api.apply_patch(str(asc), "C1", "100n")
+    api.apply_patch(str(asc), "C1", "100n")
 
-    assert any("user approved" in m["content"] for m in gated_api._history)
-    assert any("user approved" in t.text for t in gated_api._session.turns)
-
-
-def test_other_tools_are_not_gated(gated_api):
-    gated_api._tool_executor("read_netlist", {"path": "x.asc"})
-    assert gated_api._mcp.calls == [("read_netlist", {"path": "x.asc"})]
+    assert any("user approved" in str(m["content"]) for m in api._history)
+    assert any("user approved" in t.text for t in api._session.turns)
 
 
-@pytest.mark.parametrize("mode", [TOOL_MODE_NATIVE, TOOL_MODE_PROMPTED_JSON])
-def test_no_tool_mode_can_write_without_approval(tmp_path, mode):
-    """The gate is per-executor, not per-mode - adding a mode must not open a way round it.
+def test_other_tools_are_not_gated(api):
+    api._tool_executor("read_netlist", {"path": "x.asc"})
+    assert api._mcp.calls == [("read_netlist", {"path": "x.asc"})]
 
-    Driven through `Api.send_message`, so it also pins that the configured mode is the one
-    the loop actually runs in: a prompted model asking to write reaches the same
-    `_tool_executor`, is refused there, and never reaches the MCP server at all.
+
+def test_missing_credentials_is_reported_not_raised(tmp_path):
+    """No AWS setup must surface in the UI banner, not crash the window on open.
+
+    The autouse `isolated_aws_environment` fixture is what makes this a real test: it
+    removes every `AWS_*` variable and moves `~` to a temp directory, so the chain has
+    genuinely nothing to find even on a machine that is configured for AWS.
     """
-    api = build_gated_api(tmp_path, mode)
-    api._tools = PROMPTED_TOOLS
-    apply_args = {
-        "asc_path": str(tmp_path / "c.asc"),
-        "ref": "C1",
-        "new_value": "100n",
-        "apply": True,
-    }
-    if mode == TOOL_MODE_NATIVE:
-        responses = [
-            response(message(None, [("patch_component_value", apply_args)])),
-            response(message("Understood, I will show you the diff.")),
-        ]
-    else:
-        responses = [
-            prompted(
-                {
-                    "type": "tool_call",
-                    "name": "patch_component_value",
-                    "arguments": apply_args,
-                }
-            ),
-            prompted({"type": "answer", "text": "Understood, I will show you the diff."}),
-        ]
-    api._client = FakeClient(responses)
+    started = Api().start()
 
-    out = api.send_message("Apply that fix yourself right now, with apply=true.")
-
-    assert out["ok"], out.get("error")
-    assert api._mcp.calls == [], "the write reached the MCP server despite the gate"
-    assert "REFUSED" in out["tool_calls"][0]["result"]
-    assert out["text"] == "Understood, I will show you the diff."
-
-
-# --- what the model is told when a circuit is selected ----------------------------------
-
-
-class StaticCheckMCP:
-    """A server stand-in that answers check_netlist_static with two real-shaped findings."""
-
-    PAYLOAD = {
-        "source_path": "c.asc",
-        "ok": False,
-        "summary": "2 problems: 1 error, 1 warning",
-        "findings": [
-            {
-                "check": "no_dc_path",
-                "severity": "error",
-                "message": "Node vout has no DC path to ground.",
-                "refs": ["C1"],
-                "nets": ["vout"],
-                "line_no": 4,
-                "suggestion": "Add a resistor from vout to 0.",
-            },
-            {
-                "check": "single_connection_net",
-                "severity": "warning",
-                "message": "Net n002 has only one connection.",
-                "refs": ["R1"],
-                "nets": ["n002"],
-                "line_no": None,
-                "suggestion": None,
-            },
-        ],
-    }
-
-    def call_tool(self, name, arguments, timeout=300.0):
-        return json.dumps(self.PAYLOAD)
-
-
-def test_the_selection_note_carries_the_findings_not_just_a_count(tmp_path):
-    """The checks are already computed and paid for; summarising them away wastes a round.
-
-    "Found 2 errors" tells the model something is wrong without saying what, which is an
-    invitation to re-run the check it was just told about.
-    """
-    api = build_gated_api(tmp_path)
-    api._mcp = StaticCheckMCP()
-    circuit = tmp_path / "c.asc"
-    circuit.write_text("Version 4.1\n", encoding="utf-8")
-
-    result = api.select_circuit(str(circuit))
-    assert result["ok"], result.get("error")
-
-    note = api._history[-1]["content"]
-    assert str(circuit) in note
-    assert "2 problems: 1 error, 1 warning" in note
-    # The actual findings, with the details the model would otherwise have to ask for.
-    assert "error/no_dc_path" in note
-    assert "Node vout has no DC path to ground." in note
-    assert "Add a resistor from vout to 0." in note
-    assert "warning/single_connection_net" in note
-    assert "[C1, vout]" in note
-    # And an instruction not to repeat the check it has just been handed.
-    assert "not run it again" in note
-    # UI-only metadata stays out of the context.
-    assert "shadowed" not in note and "source_path" not in note
-    # Whatever the model is told, the UI still gets the whole result.
-    assert result["checks"] == StaticCheckMCP.PAYLOAD
-
-
-def test_a_long_finding_list_is_capped_in_the_model_context(tmp_path):
-    from spice_mcp_app.api import MAX_PRELOADED_FINDINGS
-
-    api = build_gated_api(tmp_path)
-    findings = [
-        {"check": f"c{i}", "severity": "error", "message": f"m{i}"}
-        for i in range(MAX_PRELOADED_FINDINGS + 3)
-    ]
-    note = Api._selection_note(
-        tmp_path / "c.asc", {"summary": "many", "findings": findings}
-    )
-
-    assert note.count("error/c") == MAX_PRELOADED_FINDINGS
-    assert "and 3 more" in note
-
-
-def test_missing_api_key_is_reported_not_raised(tmp_path, monkeypatch):
-    """A missing key must surface in the UI banner, not crash the window on open."""
-    monkeypatch.setenv("TAMU_API_KEY", "")
-    monkeypatch.setattr("spice_mcp_app.config.load_dotenv", lambda *a, **k: None)
-
-    api = Api()
-    started = api.start()
     assert started["ok"] is False
-    assert "TAMU_API_KEY" in started["error"]
-
-
-def test_llm_error_is_the_type_the_ui_catches():
-    assert issubclass(LLMError, RuntimeError)
+    assert "AWS_ACCESS_KEY_ID" in started["error"]

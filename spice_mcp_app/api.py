@@ -24,9 +24,10 @@ from spice_mcp_server.ltspice import ltspice_is_running
 from .config import Config, ConfigError, load_config
 from .llm import (
     AgentResult,
+    BedrockClient,
     LLMError,
-    TamuClient,
-    mcp_tools_to_openai,
+    append_user_note,
+    mcp_tools_to_anthropic,
     run_agent_turn,
 )
 from .mcp_client import MCPClientError, SpiceMCP, find_circuits
@@ -64,7 +65,7 @@ class Api:
                 self._config_error = str(exc)
 
         self._mcp: SpiceMCP | None = None
-        self._client: TamuClient | None = None
+        self._client: BedrockClient | None = None
         self._session: Session | None = None
         self._tools: list[dict[str, Any]] = []
         self._history: list[dict[str, Any]] = []
@@ -130,10 +131,10 @@ class Api:
             except MCPClientError as exc:
                 self._mcp = None
                 return _err(str(exc))
-            self._tools = mcp_tools_to_openai(mcp_tools)
+            self._tools = mcp_tools_to_anthropic(mcp_tools)
 
         if self._client is None:
-            self._client = TamuClient(self._config)
+            self._client = BedrockClient(self._config)
 
         if self._session is None:
             self._session = Session(
@@ -143,8 +144,7 @@ class Api:
 
         return _ok(
             model=self._config.model,
-            tool_mode=self._config.tool_mode,
-            tools=[t["function"]["name"] for t in self._tools],
+            tools=[t["name"] for t in self._tools],
             session_id=self._session.session_id,
             session_path=str(self._session.path),
             config=self._config.redacted(),
@@ -208,8 +208,17 @@ class Api:
         except json.JSONDecodeError:
             checks = {"summary": raw, "findings": [], "ok": False}
 
-        note = self._selection_note(target, checks)
-        self._history.append({"role": "user", "content": note})
+        # Tell the model which file is open, with its absolute path. Without this it has
+        # no way to know and will guess a relative name, which the server then cannot
+        # find - the tools take a path argument, not an implicit "current circuit".
+        note = (
+            f"[The user has opened this circuit: {target}\n"
+            f"Use that exact absolute path in tool calls. "
+            f"Static checks already run: {checks.get('summary', 'n/a')}]"
+        )
+        # Folded into the pending user turn rather than appended as its own: the Messages
+        # API rejects two user turns in a row, and the next question adds one.
+        append_user_note(self._history, note)
         self._session.add_turn(Turn(role="user", text=note))
 
         return _ok(
@@ -430,7 +439,7 @@ class Api:
             f"[The user approved your fix. {ref} is now {new_value} in "
             f"{resolved.name}; the file has been written.]"
         )
-        self._history.append({"role": "user", "content": note})
+        append_user_note(self._history, note)
         self._session.add_turn(Turn(role="user", text=note))
 
         # The write is never blocked on LTspice being open - the user asked for the fix and
