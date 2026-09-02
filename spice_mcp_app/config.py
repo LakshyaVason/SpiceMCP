@@ -37,6 +37,23 @@ SESSIONS_DIR = REPO_ROOT / "sessions"
 # useful answer. The values are labels for the UI and the log - never a credential.
 NO_CREDENTIALS = "none"
 
+# How the model is asked to call tools. `native` uses the Messages API `tools` parameter
+# and reads `tool_use` blocks back; `prompted_json` puts the tool catalogue in the system
+# prompt and parses one JSON object out of the reply.
+#
+# This is explicit configuration rather than a check on the model id on purpose: the
+# failure being worked around is a property of a *route* - a particular model reached
+# through a particular endpoint - and route behaviour is not derivable from a name.
+TOOL_MODE_NATIVE = "native"
+TOOL_MODE_PROMPTED_JSON = "prompted_json"
+TOOL_MODES = (TOOL_MODE_NATIVE, TOOL_MODE_PROMPTED_JSON)
+
+# Native is the default because Bedrock's Messages API does support `tools` properly -
+# that being one of the reasons this app moved onto it. `prompted_json` stays available
+# for routes that silently ignore `tools`, which is not a hypothetical: it is what the
+# retired TAMU gateway did, and the symptom was the model narrating tool calls as prose.
+DEFAULT_TOOL_MODE = TOOL_MODE_NATIVE
+
 
 class ConfigError(RuntimeError):
     """Raised when required configuration is missing."""
@@ -62,6 +79,7 @@ class Config:
             "aws_region": self.aws_region,
             "credentials": self.credentials_source,
             "sessions_dir": str(self.sessions_dir),
+            "tool_mode": self.tool_mode,
         }
 
 
@@ -132,6 +150,7 @@ def load_config(*, require_credentials: bool = True) -> Config:
         sessions_dir=_resolve_sessions_dir(
             (os.environ.get("SPICE_MCP_SESSIONS_DIR") or "").strip()
         ),
+        tool_mode=_resolve_tool_mode(os.environ.get("SPICE_MCP_TOOL_MODE")),
     )
 
 

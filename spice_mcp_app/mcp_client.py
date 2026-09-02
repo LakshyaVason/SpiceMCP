@@ -45,7 +45,9 @@ MAX_RESULT_CHARS = 60_000
 # step with the credential chain - AWS_SESSION_TOKEN, AWS_PROFILE, AWS_ROLE_ARN,
 # AWS_WEB_IDENTITY_TOKEN_FILE, AWS_CONTAINER_CREDENTIALS_*, AWS_BEARER_TOKEN_BEDROCK - and the
 # failure mode of missing one is silent: the secret travels and the test still passes.
-_LLM_ONLY_ENV = frozenset({"SPICE_MCP_MODEL", "SPICE_MCP_AWS_REGION"})
+_LLM_ONLY_ENV = frozenset(
+    {"SPICE_MCP_MODEL", "SPICE_MCP_AWS_REGION", "SPICE_MCP_TOOL_MODE"}
+)
 _LLM_ONLY_PREFIXES = ("AWS_",)
 
 

@@ -144,6 +144,7 @@ class Api:
 
         return _ok(
             model=self._config.model,
+            tool_mode=self._config.tool_mode,
             tools=[t["name"] for t in self._tools],
             session_id=self._session.session_id,
             session_path=str(self._session.path),
@@ -208,14 +209,7 @@ class Api:
         except json.JSONDecodeError:
             checks = {"summary": raw, "findings": [], "ok": False}
 
-        # Tell the model which file is open, with its absolute path. Without this it has
-        # no way to know and will guess a relative name, which the server then cannot
-        # find - the tools take a path argument, not an implicit "current circuit".
-        note = (
-            f"[The user has opened this circuit: {target}\n"
-            f"Use that exact absolute path in tool calls. "
-            f"Static checks already run: {checks.get('summary', 'n/a')}]"
-        )
+        note = self._selection_note(target, checks)
         # Folded into the pending user turn rather than appended as its own: the Messages
         # API rejects two user turns in a row, and the next question adds one.
         append_user_note(self._history, note)

@@ -90,6 +90,32 @@ This one sends real requests, so it costs real money on your AWS account. Run
 Set `SPICE_MCP_AWS_REGION` in `.env` to move regions; it falls back to `AWS_REGION`, then
 `AWS_DEFAULT_REGION`, then `us-east-1`.
 
+### Two tool-calling modes
+
+`SPICE_MCP_TOOL_MODE` picks how the model is asked to call tools:
+
+| mode | how it works | when |
+| --- | --- | --- |
+| `native` (default) | the MCP tools go in the Messages API `tools` parameter; the model replies with `tool_use` blocks | Bedrock — this is a first-class API feature there |
+| `prompted_json` | the tool catalogue goes in the **system prompt**; the model replies with one JSON object, and results come back framed as `TOOL RESULT` user messages | a route that accepts `tools` and then answers as though it had none |
+
+That second failure is not hypothetical — it is what the retired TAMU gateway did, and it
+is silent: the model narrates the tool call in its visible text, the turn "succeeds", and no
+tool ever runs. `prompted_json` keeps the app working on such a route without pretending the
+native channel is open.
+
+The mode is **explicit configuration, never inferred from a model name.** A misspelling is
+rejected at startup rather than falling back to the default, because falling back is exactly
+the silent-wrong-answer this setting exists to avoid. The running mode is shown in the app's
+header. Use `probe_tool_calling.py --prompted-json` to check the fallback on a model before
+switching to it; nothing about a native pass or failure changes when you do.
+
+The parser is deliberately strict: the reply must *begin* with the JSON object (decoded from
+index 0 — no scanning prose for something brace-shaped), `type` must be `tool_call` or
+`answer`, and the name must be one of the tools actually supplied. Anything else earns a
+correction message rather than an execution. Arbitrary prose and `antml`-style markup are
+never interpreted as tool calls.
+
 ## Running the app
 
 ```bat
@@ -252,7 +278,7 @@ GUI — which is the whole point of patching the `.asc` rather than a netlist.
 python -m pytest
 ```
 
-225 tests, ~40s. Parser and static-check tests run without LTspice installed; schematic
+272 tests, ~40s. Parser and static-check tests run without LTspice installed; schematic
 tests skip automatically if the executable is not found. Nothing in the suite calls the
 network, so running it costs nothing — the live-model checks are the two scripts,
 `probe_tool_calling.py` and `app_smoke.py` (a headless nine-stage end-to-end run against

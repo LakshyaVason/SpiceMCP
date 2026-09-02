@@ -23,13 +23,29 @@ Facts about this transport that the code depends on:
   * **Consecutive same-role turns are rejected.** `append_user_note` exists for that -
     see its docstring.
 
+There are two tool-calling modes, selected by `SPICE_MCP_TOOL_MODE`:
+
+  * **`native`** (the default) sends the `tools` parameter and reads `tool_use` blocks
+    back. This is what Bedrock's Messages API supports properly, and the reason the app
+    moved onto it.
+  * **`prompted_json`** puts the tool catalogue in the system prompt and asks for one
+    JSON object per reply. It exists for routes that accept `tools` and then ignore it -
+    not hypothetical: the retired TAMU gateway did exactly that, and the symptom was the
+    model *narrating* a tool call in its visible text while the turn "succeeded". A
+    session log with no `tool_calls` key on any turn is that failure.
+
+The mode is explicit configuration rather than a guess from the model id, because the
+behaviour belongs to a route (a model reached through an endpoint), not to a name.
+
 This module never imports `mcp`. It takes a `tool_executor` callable, which keeps the
 LLM side testable with a fake and the MCP side replaceable. Both modes converge on that
-one callable, so the approval gate in `Api._tool_executor` covers both.
+one callable - through `_execute_tool` - so the approval gate in `Api._tool_executor`
+covers both, and picking a mode buys the model no extra reach over the user's files.
 """
 
 from __future__ import annotations
 
+import json
 import logging
 from collections.abc import Mapping
 from dataclasses import dataclass, field
@@ -38,7 +54,12 @@ from typing import Any, Callable, Iterable, Protocol
 import anthropic
 from anthropic import AnthropicBedrock
 
-from .config import Config
+from .config import (
+    TOOL_MODE_NATIVE,
+    TOOL_MODE_PROMPTED_JSON,
+    TOOL_MODES,
+    Config,
+)
 from .session import Session, Turn, usage_value
 
 log = logging.getLogger(__name__)
@@ -47,6 +68,12 @@ log = logging.getLogger(__name__)
 # (read_netlist -> check_netlist_static -> maybe run_simulation); a model that wants 12
 # rounds is stuck, and each round costs tokens.
 MAX_TOOL_ROUNDS = 12
+
+# In prompted-JSON mode a reply that is not protocol JSON costs a round to correct. One
+# correction is worth paying for (a stray code fence, a sentence of preamble); a model
+# that cannot produce the protocol twice in a row will not produce it on the third try
+# either, so the turn ends with its text rather than burning the whole round budget.
+MAX_PROTOCOL_CORRECTIONS = 2
 
 # Required by the API, and it has to leave room for thinking tokens as well as the answer.
 MAX_TOKENS = 16000
@@ -118,15 +145,6 @@ TOOLS"""
 # but a stop sequence means we do not pay for those tokens either.
 PROMPTED_STOP = ["TOOL RESULT"]
 
-# Omit `max_tokens` and the gateway caps the completion at 1024 - verified 2026-09-01 by
-# asking for a long reply with and without it (1024 vs 4096 completion tokens, both with
-# finish_reason "length"). 1024 cuts a full diagnosis off mid-sentence, and in prompted
-# mode it lands mid-JSON, so the reply is unparseable and a correction round has to be
-# paid for on top of the output already wasted. An explicit ceiling is the cheaper end of
-# that trade: seen live, the truncated attempt burned 1024 output tokens and a 6.6k-token
-# retry to say what fitted in 688.
-DEFAULT_MAX_REPLY_TOKENS = 2048
-
 PROMPTED_CORRECTION = (
     'PROTOCOL ERROR\n{reason}\nNothing was run. Reply with exactly one JSON object and '
     'nothing else: {{"type":"tool_call","name":"<tool>","arguments":{{...}}}} or '
@@ -134,9 +152,11 @@ PROMPTED_CORRECTION = (
 )
 
 # A truncated reply is unparseable for a reason the generic correction misdiagnoses: the
-# JSON was well-formed until the output cap cut it off mid-string. Observed live - a long
-# answer stopped at exactly 1024 completion tokens, and telling the model its JSON was
-# invalid would have it hunt for a syntax error it never made. Verified 2026-09-01.
+# JSON was well-formed until the output cap cut it off mid-string, and telling the model
+# its JSON was invalid would have it hunt for a syntax error it never made. Observed live
+# on the retired gateway, which capped a reply at 1024 tokens when `max_tokens` was
+# omitted. Bedrock cannot do that silently - `max_tokens` is mandatory and MAX_TOKENS is
+# generous - but a long enough answer can still hit the ceiling, so the diagnosis stays.
 PROMPTED_TRUNCATED = (
     "PROTOCOL ERROR\nYour reply hit the output length limit part-way through the JSON, "
     "so it could not be parsed and nothing was run. Send the same object again but "
@@ -152,6 +172,18 @@ class ToolExecutor(Protocol):
 
 class LLMError(RuntimeError):
     """A call to the model failed in a way worth showing the user."""
+
+
+class ProtocolError(ValueError):
+    """A prompted-mode reply was not a valid protocol message.
+
+    `requested_name` is set when the reply did name a tool - an unknown name, say - so
+    the caller can record the rejected attempt without executing anything.
+    """
+
+    def __init__(self, message: str, *, requested_name: str | None = None) -> None:
+        super().__init__(message)
+        self.requested_name = requested_name
 
 
 def mcp_tools_to_anthropic(mcp_tools: Iterable[Any]) -> list[dict[str, Any]]:
@@ -188,6 +220,158 @@ def mcp_tools_to_anthropic(mcp_tools: Iterable[Any]) -> list[dict[str, Any]]:
             }
         )
     return mapped
+
+
+def _tool_spec(tool: Any) -> tuple[str, str, dict[str, Any]]:
+    """Pull (name, description, schema) out of one Anthropic-shaped tool definition."""
+    source = tool if isinstance(tool, Mapping) else {}
+    schema = source.get("input_schema") or {"type": "object", "properties": {}}
+    return (
+        str(source.get("name") or ""),
+        str(source.get("description") or ""),
+        schema,
+    )
+
+
+def tool_names(tools: Iterable[dict[str, Any]] | None) -> list[str]:
+    """The tool names in an Anthropic `tools` array, in order."""
+    return [name for name, _, _ in (_tool_spec(t) for t in tools or []) if name]
+
+
+def prompted_protocol_prompt(tools: Iterable[dict[str, Any]] | None) -> str:
+    """Render the protocol and the tool catalogue for the system prompt.
+
+    Takes the same `tools` array native mode sends over the wire, so there is one source
+    of truth for what the model is told a tool takes - and so the two modes stay
+    comparable on tokens: the descriptions and schemas are identical, only the transport
+    differs.
+    """
+    lines = [PROMPTED_PROTOCOL_HEADER]
+    for tool in tools or []:
+        name, description, schema = _tool_spec(tool)
+        if not name:
+            continue
+        lines.append(f"\n{name}")
+        if description:
+            lines.append(description.strip())
+        # Compact separators: the schema is machine-readable input for the model, and
+        # pretty-printing it would cost tokens for whitespace on every round.
+        lines.append(
+            "arguments: " + json.dumps(schema, separators=(",", ":"), sort_keys=False)
+        )
+    return "\n".join(lines)
+
+
+def prompted_system_prompt(tools: Iterable[dict[str, Any]] | None) -> str:
+    """The full system prompt for prompted mode.
+
+    Built per request rather than stored, because Bedrock has no system *role*: the
+    system prompt is a top-level parameter on every call, so there is nowhere in the
+    message history to keep it. A `{"role": "system"}` message is a 400.
+    """
+    return SYSTEM_PROMPT + "\n\n" + prompted_protocol_prompt(tools)
+
+
+def _strip_code_fence(text: str) -> str:
+    """Remove one wrapping ``` fence, if that is all that is wrong with the reply.
+
+    Narrow on purpose. A fence is the one formatting habit worth tolerating, because
+    models add it reflexively to anything that looks like JSON. Anything beyond it -
+    prose, several objects, tag markup - is left to fail parsing and earn a correction,
+    because guessing at which brace in a paragraph was meant to be a tool call is how
+    you end up executing something the model never asked for.
+    """
+    stripped = text.strip()
+    if not stripped.startswith("```"):
+        return stripped
+    body = stripped[3:]
+    newline = body.find("\n")
+    if newline == -1:
+        return stripped
+    # Only the language tag may sit on the opening line ("```json").
+    if body[:newline].strip().isalpha() or not body[:newline].strip():
+        body = body[newline + 1 :]
+    else:
+        return stripped
+    if body.rstrip().endswith("```"):
+        body = body.rstrip()[:-3]
+    return body.strip()
+
+
+def parse_prompted_reply(text: str, *, known_tools: Iterable[str]) -> dict[str, Any]:
+    """Validate one prompted-mode reply and return a normalized protocol message.
+
+    Returns either `{"type": "tool_call", "name": str, "arguments": dict}` or
+    `{"type": "answer", "text": str}`. Raises `ProtocolError` for anything else - and
+    raising is the point: nothing is executed unless the request parsed *and* named a
+    tool the app actually supplied.
+    """
+    candidate = _strip_code_fence(text or "")
+    if not candidate:
+        raise ProtocolError("Your reply was empty.")
+
+    # Decoded from position 0, so the reply must *begin* with the JSON object - no
+    # searching the text for something brace-shaped. Anything after the first object is
+    # discarded, which is the safe direction: a model that role-plays the rest of the
+    # exchange (a fabricated TOOL RESULT and an answer quoting it - observed live) gets
+    # its real first request executed and its invented remainder thrown away.
+    try:
+        payload, end = json.JSONDecoder().raw_decode(candidate)
+    except json.JSONDecodeError as exc:
+        raise ProtocolError(f"Your reply was not valid JSON ({exc.msg}).") from exc
+
+    trailing = candidate[end:].strip()
+    if trailing:
+        log.warning(
+            "discarded %d characters after the protocol object: %.200s",
+            len(trailing),
+            trailing,
+        )
+
+    if not isinstance(payload, dict):
+        raise ProtocolError("The JSON must be an object, not a list or a bare value.")
+
+    kind = payload.get("type")
+    if kind == "answer":
+        answer = payload.get("text")
+        if not isinstance(answer, str):
+            raise ProtocolError('An "answer" needs a "text" string.')
+        return {"type": "answer", "text": answer}
+
+    if kind != "tool_call":
+        raise ProtocolError('"type" must be "tool_call" or "answer".')
+
+    name = payload.get("name")
+    if not isinstance(name, str) or not name:
+        raise ProtocolError('A "tool_call" needs a "name" string.')
+
+    arguments = payload.get("arguments")
+    if arguments is None:
+        arguments = {}
+    if not isinstance(arguments, dict):
+        raise ProtocolError(
+            '"arguments" must be an object of named arguments.', requested_name=name
+        )
+
+    allowed = list(known_tools)
+    if name not in allowed:
+        raise ProtocolError(
+            f"There is no tool called {name!r}. The tools you have are: "
+            f"{', '.join(allowed) or '(none)'}.",
+            requested_name=name,
+        )
+
+    return {"type": "tool_call", "name": name, "arguments": arguments}
+
+
+def prompted_tool_result_message(name: str, result: str) -> dict[str, Any]:
+    """Frame a real tool result so the model cannot mistake its own text for one.
+
+    Sent as a user-role message because prompted mode has no `tool_use_id` to attach a
+    `tool_result` block to. The "TOOL RESULT" label is what the system prompt tells the
+    model is the only genuine tool output.
+    """
+    return {"role": "user", "content": f"TOOL RESULT\nname: {name}\nresult:\n{result}"}
 
 
 @dataclass
@@ -242,6 +426,7 @@ class BedrockClient:
         tools: list[dict[str, Any]] | None = None,
         system: str = SYSTEM_PROMPT,
         max_tokens: int = MAX_TOKENS,
+        stop_sequences: list[str] | None = None,
     ) -> Any:
         """One turn. Returns the SDK's Message object."""
         try:
@@ -251,6 +436,7 @@ class BedrockClient:
                 system=system,
                 messages=messages,
                 tools=tools or anthropic.NOT_GIVEN,
+                stop_sequences=stop_sequences or anthropic.NOT_GIVEN,
             )
         except (anthropic.NotFoundError, anthropic.PermissionDeniedError) as exc:
             # By far the most likely first-run failure, and the SDK's own message does not
@@ -299,6 +485,86 @@ def _response_text(response: Any) -> str:
     return "".join(parts)
 
 
+def _execute_tool(
+    tool_executor: ToolExecutor | None,
+    name: str,
+    arguments: dict[str, Any],
+    on_progress: Callable[[str], None] | None,
+) -> ToolCallRecord:
+    """Run one tool through the caller's executor and record what came back.
+
+    The single place either mode reaches MCP. Both loops funnel through here, so the
+    approval gate the executor implements cannot be sidestepped by picking a mode.
+    """
+    if tool_executor is None:
+        return ToolCallRecord(
+            name, arguments, "No tools are available in this session.", True
+        )
+
+    if on_progress:
+        on_progress(f"{name}({', '.join(f'{k}={v!r}' for k, v in arguments.items())})")
+    try:
+        return ToolCallRecord(name, arguments, tool_executor(name, arguments), False)
+    except Exception as exc:
+        # Hand the failure to the model rather than aborting: a bad path or an
+        # unsupported file is something it can recover from by calling the tool
+        # differently.
+        log.warning("tool %s failed: %s", name, exc)
+        return ToolCallRecord(name, arguments, f"Tool {name} failed: {exc}", True)
+
+
+def _usage_tokens(usage: Any) -> tuple[int, int]:
+    """Round totals from a Bedrock usage block, tolerating dicts and SDK objects."""
+    return (
+        int(usage_value(usage, "input_tokens") or 0),
+        int(usage_value(usage, "output_tokens") or 0),
+    )
+
+
+def _log_round(
+    session: Session,
+    text: str,
+    usage: Any,
+    round_records: list[ToolCallRecord],
+) -> None:
+    """Write one model round to the session log: the assistant turn, then its results.
+
+    Called for every API response in both modes, including ones that failed to parse -
+    the request was billed either way, and a log that quietly omits the expensive rounds
+    would misreport the cost comparison this project exists to make.
+    """
+    session.add_turn(
+        Turn.from_usage(
+            "assistant",
+            text,
+            usage,
+            tool_calls=[r.to_dict() for r in round_records] or None,
+        )
+    )
+    for record in round_records:
+        session.add_turn(Turn(role="tool", text=record.result))
+
+
+def _exhausted(
+    records: list[ToolCallRecord],
+    total_in: int,
+    total_out: int,
+    protocol_errors: int = 0,
+) -> AgentResult:
+    """Out of rounds. Return the partial work rather than raising - it was paid for."""
+    return AgentResult(
+        text=(
+            f"Stopped after {MAX_TOOL_ROUNDS} tool rounds without a final answer. "
+            "The last tool results are above; try asking a narrower question."
+        ),
+        tool_calls=records,
+        rounds=MAX_TOOL_ROUNDS,
+        input_tokens=total_in,
+        output_tokens=total_out,
+        protocol_errors=protocol_errors,
+    )
+
+
 def append_user_note(history: list[dict[str, Any]], text: str) -> None:
     """Add user-role text to the history without creating two consecutive user turns.
 
@@ -338,7 +604,7 @@ def run_agent_turn(
     each turn completes rather than at the end, so an interrupted session still leaves
     complete token counts behind.
 
-    `tool_mode` selects how tools are offered - `native` sends the OpenAI `tools` array,
+    `tool_mode` selects how tools are offered - `native` sends the `tools` parameter,
     `prompted_json` puts the catalogue in the system prompt instead. See the module
     docstring for why both exist.
     """
@@ -361,14 +627,14 @@ def run_agent_turn(
 
 
 def _run_native_turn(
-    client: TamuClient,
+    client: BedrockClient,
     session: Session,
     tools: list[dict[str, Any]] | None,
     tool_executor: ToolExecutor | None,
     history: list[dict[str, Any]],
     on_progress: Callable[[str], None] | None,
 ) -> AgentResult:
-    """The OpenAI path: `tools` on the request, `tool_calls` on the reply."""
+    """The native path: `tools` on the request, `tool_use` blocks on the reply."""
     records: list[ToolCallRecord] = []
     total_in = 0
     total_out = 0
@@ -376,8 +642,9 @@ def _run_native_turn(
     for round_index in range(1, MAX_TOOL_ROUNDS + 1):
         response = client.complete(history, tools=tools)
         usage = _block_field(response, "usage")
-        total_in += int(usage_value(usage, "input_tokens") or 0)
-        total_out += int(usage_value(usage, "output_tokens") or 0)
+        round_in, round_out = _usage_tokens(usage)
+        total_in += round_in
+        total_out += round_out
 
         text = _response_text(response)
         stop_reason = _block_field(response, "stop_reason")
@@ -401,39 +668,24 @@ def _run_native_turn(
 
             if not valid_input:
                 log.warning("tool %s sent non-dict input: %r", name, raw_input)
-                result = (
+                record = ToolCallRecord(
+                    name,
+                    arguments,
                     f"Your input for {name} was not an object. Send the arguments as "
-                    "a JSON object and try again."
+                    "a JSON object and try again.",
+                    True,
                 )
-                is_error = True
-            elif tool_executor is None:
-                result = "No tools are available in this session."
-                is_error = True
             else:
-                if on_progress:
-                    on_progress(
-                        f"{name}({', '.join(f'{k}={v!r}' for k, v in arguments.items())})"
-                    )
-                try:
-                    result = tool_executor(name, arguments)
-                    is_error = False
-                except Exception as exc:
-                    # Hand the failure to the model rather than aborting: a bad path or
-                    # an unsupported file is something it can recover from by calling the
-                    # tool differently.
-                    log.warning("tool %s failed: %s", name, exc)
-                    result = f"Tool {name} failed: {exc}"
-                    is_error = True
+                record = _execute_tool(tool_executor, name, arguments, on_progress)
 
-            record = ToolCallRecord(name, arguments, result, is_error)
             round_records.append(record)
             records.append(record)
             results.append(
                 {
                     "type": "tool_result",
                     "tool_use_id": _block_field(block, "id"),
-                    "content": result,
-                    "is_error": is_error,
+                    "content": record.result,
+                    "is_error": record.is_error,
                 }
             )
 
@@ -441,16 +693,7 @@ def _run_native_turn(
             # One message carrying every result from this round. Splitting them is rejected.
             history.append({"role": "user", "content": results})
 
-        session.add_turn(
-            Turn.from_usage(
-                "assistant",
-                text,
-                usage,
-                tool_calls=[r.to_dict() for r in round_records] or None,
-            )
-        )
-        for record in round_records:
-            session.add_turn(Turn(role="tool", text=record.result))
+        _log_round(session, text, usage, round_records)
 
         if stop_reason != "tool_use":
             if stop_reason == "max_tokens":
@@ -471,7 +714,7 @@ def _run_native_turn(
 
 
 def _run_prompted_turn(
-    client: TamuClient,
+    client: BedrockClient,
     session: Session,
     tools: list[dict[str, Any]] | None,
     tool_executor: ToolExecutor | None,
@@ -482,9 +725,12 @@ def _run_prompted_turn(
 
     `tools` is deliberately *not* sent on the request here: on such a route it is dead
     weight in the prompt budget, and sending it would make a failure ambiguous between
-    "the model ignored it" and "the model chose not to use it".
+    "the model ignored it" and "the model chose not to use it". The catalogue goes into
+    the system prompt instead, which Bedrock takes as a top-level parameter on every
+    call - there is no system *role* to put it in the history once.
     """
     known = tool_names(tools)
+    system = prompted_system_prompt(tools)
     records: list[ToolCallRecord] = []
     total_in = 0
     total_out = 0
@@ -492,20 +738,27 @@ def _run_prompted_turn(
     consecutive_failures = 0
 
     for round_index in range(1, MAX_TOOL_ROUNDS + 1):
-        body = client.complete(history, stop=PROMPTED_STOP)
-        choice = body["choices"][0]
-        message = choice["message"]
-        truncated = choice.get("finish_reason") == "length"
-        usage = body.get("usage") or {}
+        response = client.complete(
+            history, system=system, stop_sequences=PROMPTED_STOP
+        )
+        usage = _block_field(response, "usage")
+        truncated = _block_field(response, "stop_reason") == "max_tokens"
         round_in, round_out = _usage_tokens(usage)
         total_in += round_in
         total_out += round_out
 
-        text = _message_text(message)
-        # Normalized rather than verbatim: there is no provider-side tool_call structure
-        # to preserve in this mode, and echoing back a stray `tool_calls` field the model
-        # never meant would confuse the next round.
-        history.append({"role": "assistant", "content": text})
+        text = _response_text(response)
+        # The visible text only, not `content` verbatim: thinking blocks have to be
+        # returned unchanged when they accompany a `tool_use`, and in this mode there is
+        # never one - the whole point is that the provider produced no tool structure to
+        # preserve. An empty reply is skipped because the API rejects empty content, and
+        # inventing text for the assistant would put words in the transcript it never
+        # said; `append_user_note` then keeps the correction from forming a second
+        # consecutive user turn.
+        if text.strip():
+            history.append({"role": "assistant", "content": text})
+        else:
+            log.warning("prompted reply had no visible text; not adding it to history")
 
         try:
             parsed = parse_prompted_reply(text, known_tools=known)
@@ -548,13 +801,11 @@ def _run_prompted_turn(
                     protocol_errors=protocol_errors,
                 )
 
-            history.append(
-                {
-                    "role": "user",
-                    "content": PROMPTED_TRUNCATED
-                    if truncated
-                    else PROMPTED_CORRECTION.format(reason=exc),
-                }
+            append_user_note(
+                history,
+                PROMPTED_TRUNCATED
+                if truncated
+                else PROMPTED_CORRECTION.format(reason=exc),
             )
             continue
 

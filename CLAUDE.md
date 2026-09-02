@@ -173,6 +173,43 @@ with no `tool_calls` key is the symptom to look for.
   3000`). A `startswith("Value")` match patches the wrong line, so `asc.py` tokenises the
   attribute name.
 
+### Two tool-calling modes — `SPICE_MCP_TOOL_MODE`
+
+`native` (the default, and the right answer on Bedrock) sends the MCP tools in the `tools`
+parameter and reads back `tool_use` blocks. `prompted_json` puts the catalogue in the system
+prompt, has the model reply with **one JSON object**, and frames results as `TOOL RESULT`
+user messages. It exists because a route can accept `tools` and then answer as though it had
+none — what the retired TAMU gateway did to `us.anthropic.claude-opus-5`, silently. Both live
+in `llm.py`; `run_agent_turn` dispatches on the config value.
+
+- **The mode is explicit configuration, never inferred from a model name.** A typo raises
+  `ConfigError` rather than falling back to native: a silent fallback is precisely the failure
+  the setting exists to catch. Only `us.anthropic.claude-opus-5` on the TAMU gateway was ever
+  observed ignoring `tools` — don't generalise that to other `us.anthropic` profiles.
+- **The approval gate covers both modes.** Both converge on `llm.py:_execute_tool`, which
+  calls the executor `api.py` supplies, so `prompted_json` buys the model no extra reach.
+  `tests/test_llm.py::test_no_tool_mode_can_write_without_approval` is parametrized over both.
+- **The parser never interprets prose.** `parse_prompted_reply` `raw_decode`s from index 0, so
+  the reply must *begin* with the object; one wrapping ``` fence is tolerated and nothing else.
+  Unknown tool names, non-object `arguments` and wrong `type` values all raise `ProtocolError`,
+  which becomes a correction message to the model — never an execution. Regex-scanning text
+  for `antml:invoke` markup was explicitly ruled out by the user; do not reintroduce it.
+- A malformed reply costs a re-ask, bounded by `MAX_PROTOCOL_CORRECTIONS = 2`. The correction
+  goes through `append_user_note`, not a second user message — Bedrock rejects consecutive
+  same-role turns, and a `TOOL RESULT` message may already be pending.
+- `stop_sequences=PROMPTED_STOP` (`["TOOL RESULT"]`) stops the model role-playing the tool's
+  reply. It has been seen fabricating a result and an answer quoting it; anything after the
+  first JSON object is discarded with a warning, which is the safe direction.
+- **`prompted_system_prompt` is rebuilt per request** because there is nowhere in the history
+  to keep it. `tests/test_llm.py` asserts the protocol text is present on *every* call and
+  that no `{"role": "system"}` message is ever appended.
+- `SPICE_MCP_TOOL_MODE` is in `mcp_client._LLM_ONLY_ENV`: how the model is asked to call tools
+  is not the server's business.
+- `scripts\probe_tool_calling.py --prompted-json` probes the fallback using the app's real
+  prompt builder, stop sequence and parser, so a pass is evidence about shipping code. **The
+  native probe's meaning is fixed** — it passes only on a real `tool_use` block, and is not to
+  be relaxed so that some model prints PASS.
+
 ### Known limitation
 
 **Automated verification that the pywebview window *renders* is blocked.** `evaluate_js` from
@@ -225,14 +262,15 @@ into. Names starting with `_` are skipped, and objects can opt out with
 
 ```bat
 .venv\Scripts\activate
-python -m pytest                        REM 225 tests, ~40s
+python -m pytest                        REM 272 tests, ~40s
 python -m spice_mcp_app                 REM the desktop app; --folder fixtures --debug
 python -m spice_mcp_app --file fixtures\wrong_value_lowpass.asc   REM one circuit, pre-checked
 python -m spice_mcp_app.launch fixtures\wrong_value_lowpass.asc --no-ltspice
 python -m spice_mcp_server              REM stdio server; sits waiting for a client
 python scripts\install_context_menu.py  REM right-click verb; --status / --uninstall
 python scripts\list_bedrock_models.py   REM inference profiles + model access; free
-python scripts\probe_tool_calling.py    REM 3-stage Bedrock check; costs a few tokens
+python scripts\probe_tool_calling.py    REM 3-stage Bedrock check; --prompted-json for the
+                                        REM other tool mode. Costs a few tokens.
 python scripts\app_smoke.py             REM headless end-to-end, no window; costs money
 ```
 
@@ -241,7 +279,7 @@ and `°`, which crash a cp1252 console.
 
 `.mcp.json` registers the server so it can be driven from Claude Code directly.
 
-## State: Steps 0–8, the Explorer launcher, and the Bedrock migration; 225 tests pass
+## State: Steps 0–8, the Explorer launcher, and the Bedrock migration; 272 tests pass
 
 **Server half — `spice_mcp_server/`, seven tools**, all verified over a real MCP stdio
 handshake. It still knows nothing about LLMs.
@@ -381,7 +419,7 @@ part that genuinely needs eyes.
 5. In LTspice: **File ▸ Revert** → `C1` shows the new value in the GUI. ← closes the GUI item.
 6. `python scripts\install_context_menu.py --uninstall` — the entry is gone.
 
-Automated up to that point: 225 tests, plus a headless launcher run verified to reach window
+Automated up to that point: 272 tests, plus a headless launcher run verified to reach window
 creation with `get_initial_folder()` returning the resolved folder and circuit, cwd back at
 the repo root, and nothing written beside the fixture.
 

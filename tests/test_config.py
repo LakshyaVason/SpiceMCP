@@ -14,11 +14,17 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from spice_mcp_app.config import (
     DEFAULT_REGION,
+    DEFAULT_TOOL_MODE,
     NO_CREDENTIALS,
     REPO_ROOT,
     SESSIONS_DIR,
+    TOOL_MODE_NATIVE,
+    TOOL_MODE_PROMPTED_JSON,
+    ConfigError,
     load_config,
 )
 from spice_mcp_app.mcp_client import _server_params
@@ -101,6 +107,49 @@ def test_the_region_falls_back_through_the_standard_aws_variables(monkeypatch):
     assert load_config().aws_region == "eu-west-1"
 
 
+# --- the tool-calling mode -------------------------------------------------------------
+
+
+@pytest.fixture
+def env(monkeypatch):
+    """Credentials present, so only the variable under test decides the outcome."""
+    with_keys(monkeypatch)
+    monkeypatch.delenv("SPICE_MCP_TOOL_MODE", raising=False)
+    return monkeypatch
+
+
+def test_the_default_tool_mode_is_native(env):
+    """Bedrock's Messages API does support `tools`, so the default must stay native."""
+    assert load_config().tool_mode == TOOL_MODE_NATIVE == DEFAULT_TOOL_MODE
+
+
+def test_the_tool_mode_is_read_from_the_environment(env):
+    env.setenv("SPICE_MCP_TOOL_MODE", "prompted_json")
+    assert load_config().tool_mode == TOOL_MODE_PROMPTED_JSON
+
+
+def test_the_tool_mode_is_case_and_space_insensitive(env):
+    env.setenv("SPICE_MCP_TOOL_MODE", "  Prompted_JSON ")
+    assert load_config().tool_mode == TOOL_MODE_PROMPTED_JSON
+
+
+def test_a_misspelled_tool_mode_is_rejected_rather_than_ignored(env):
+    """Falling back to native on a typo is the failure this mode exists to fix.
+
+    `prompted-json` with a hyphen would send `tools` to a route that ignores it, and the
+    app would look like it worked while never calling MCP.
+    """
+    env.setenv("SPICE_MCP_TOOL_MODE", "prompted-json")
+    with pytest.raises(ConfigError, match="SPICE_MCP_TOOL_MODE"):
+        load_config()
+
+
+def test_the_tool_mode_appears_in_the_config_the_ui_is_shown(env):
+    """The UI shows `redacted()`; a wrong mode is otherwise invisible from inside the app."""
+    env.setenv("SPICE_MCP_TOOL_MODE", "prompted_json")
+    assert load_config().redacted()["tool_mode"] == "prompted_json"
+
+
 # --- what the server subprocess inherits ----------------------------------------------
 
 
@@ -127,12 +176,15 @@ def test_the_server_is_not_given_the_aws_credentials(monkeypatch):
     monkeypatch.setenv("AWS_ROLE_ARN", "arn:aws:iam::1:role/nowhere")
     monkeypatch.setenv("SPICE_MCP_MODEL", "some-model")
     monkeypatch.setenv("SPICE_MCP_AWS_REGION", "us-east-1")
+    monkeypatch.setenv("SPICE_MCP_TOOL_MODE", "prompted_json")
 
     env = _server_params().env
 
     assert not [name for name in env if name.startswith("AWS_")]
     assert "SPICE_MCP_MODEL" not in env
     assert "SPICE_MCP_AWS_REGION" not in env
+    # How the *model* is asked to call tools is not the server's business either.
+    assert "SPICE_MCP_TOOL_MODE" not in env
     assert "should-not-travel" not in "".join(env.values())
     assert "nor-should-this" not in "".join(env.values())
 
