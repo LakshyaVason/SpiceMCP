@@ -20,9 +20,15 @@ it is not ours to improve:
 
 Two things to keep in mind:
 
-  * TAMU is OpenAI-shaped and returns `usage.prompt_tokens` / `usage.completion_tokens`.
-    `Turn.from_usage` **maps** those to `input_tokens` / `output_tokens` so the schema
-    above stays stable no matter what the provider calls them.
+  * Bedrock returns `usage.input_tokens` / `usage.output_tokens` - already the schema's
+    own names, so `Turn.from_usage` no longer renames anything. What it still does, and
+    must keep doing, is **warn when an assistant turn arrives without usage**: silently
+    null counts once let a whole session log look complete while under-reporting
+    everything, and that is the failure mode this log exists to rule out.
+  * `usage` also carries `cache_read_input_tokens` / `cache_creation_input_tokens` on
+    Bedrock. Prompt caching is not enabled, so those are ignored - the schema above is
+    fixed by an external comparison and must not gain keys. If caching is ever turned on,
+    the comparison needs revisiting before this log does.
   * The file is rewritten after every turn. A session that crashes mid-debug still
     leaves a usable log, which matters because a crashed session is exactly the kind
     we want token numbers for.
@@ -37,6 +43,7 @@ import logging
 import os
 import tempfile
 import uuid
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -47,6 +54,20 @@ log = logging.getLogger(__name__)
 
 def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def usage_value(usage: Any, name: str) -> Any:
+    """Read a field from a usage block, tolerating both an SDK object and a plain dict.
+
+    The SDK hands back a pydantic `Usage`, but tests and the agent loop both pass dicts.
+    Reading through here rather than converting to a dict up front is what keeps a genuinely
+    absent field distinguishable from a zero, so the warning below can still fire.
+    """
+    if usage is None:
+        return None
+    if isinstance(usage, Mapping):
+        return usage.get(name)
+    return getattr(usage, name, None)
 
 
 @dataclass
@@ -62,22 +83,20 @@ class Turn:
         cls,
         role: str,
         text: str,
-        usage: dict[str, Any] | None,
+        usage: Any,
         tool_calls: list[dict[str, Any]] | None = None,
     ) -> Turn:
-        """Build a turn from an OpenAI-shaped `usage` object.
+        """Build a turn from a provider `usage` block - an object or a dict.
 
-        This is the one place the provider's field names are translated. A missing
-        usage block logs a warning rather than passing silently: null token counts
+        A missing count logs a warning rather than passing silently: null token counts
         would quietly invalidate the cost comparison, which is the whole point of
         keeping this log.
         """
-        usage = usage or {}
-        prompt = usage.get("prompt_tokens")
-        completion = usage.get("completion_tokens")
+        prompt = usage_value(usage, "input_tokens")
+        completion = usage_value(usage, "output_tokens")
         if role == "assistant" and (prompt is None or completion is None):
             log.warning(
-                "assistant turn has incomplete usage (prompt=%s completion=%s); "
+                "assistant turn has incomplete usage (input=%s output=%s); "
                 "the session log will under-report tokens",
                 prompt,
                 completion,

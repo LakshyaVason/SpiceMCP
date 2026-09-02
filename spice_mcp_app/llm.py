@@ -1,18 +1,27 @@
-"""TAMU AI Chat client, MCP->OpenAI tool translation, and the agent loop.
+"""Bedrock client, MCP->Anthropic tool mapping, and the agent loop.
 
-The proxy is OpenAI-compatible, with two deviations found by probing it (see
-`scripts/probe_tool_calling.py`, which is the reproducer for both):
+The transport is AWS Bedrock through `anthropic.AnthropicBedrock`, which speaks the
+native Messages API. That means tool calling needs no translation layer: an MCP tool
+definition is already `{name, description, input_schema}`, which is exactly what
+Anthropic's `tools` parameter wants.
 
-  * **`"stream": false` must be sent explicitly.** Omit it and the proxy replies with
-    `text/event-stream` *and* drops the `usage` block entirely. Since per-turn token
-    counts are the reason the session log exists, every request forces it off.
-  * The TAMU gateway exposes the OpenAI-compatible API under `/v1` on the gateway host.
-    The correct path is `{base_url}/v1/chat/completions`.
+Facts about this transport that the code depends on:
 
-Tool calling itself works fully on `protected.Claude Opus 4.8`: `tool_calls` come back
-with parseable JSON arguments, `role: "tool"` results are accepted, and `usage` is
-present on every turn. The prompted-JSON fallback the plan held in reserve is not
-needed.
+  * **`max_tokens` is required on every request.** There is no default.
+  * **Never pass `thinking`.** Adaptive thinking is on by default for Opus 5, and
+    `thinking: {"type": "disabled"}` makes the model occasionally write a tool call into
+    its *visible text* instead of a `tool_use` block - the turn succeeds, the call never
+    runs, and nothing raises. That is precisely the failure this module was rewritten to
+    fix, so leaving thinking alone is load-bearing. `budget_tokens` is rejected with a
+    400 on Opus 5 and must not be reintroduced either.
+  * **Thinking blocks come back in `content` and must be handed back unchanged** when the
+    same turn carries a `tool_use`. The loop appends `response.content` verbatim, which
+    covers it; `_response_text` filters them out of what the user sees.
+  * **All results from one round go back in a single user message.** The model may emit
+    several `tool_use` blocks at once, and splitting their `tool_result` blocks across
+    messages is rejected.
+  * **Consecutive same-role turns are rejected.** `append_user_note` exists for that -
+    see its docstring.
 
 This module never imports `mcp`. It takes a `tool_executor` callable, which keeps the
 LLM side testable with a fake and the MCP side replaceable.
@@ -20,15 +29,16 @@ LLM side testable with a fake and the MCP side replaceable.
 
 from __future__ import annotations
 
-import json
 import logging
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any, Callable, Iterable, Protocol
 
-import requests
+import anthropic
+from anthropic import AnthropicBedrock
 
 from .config import Config
-from .session import Session, Turn
+from .session import Session, Turn, usage_value
 
 log = logging.getLogger(__name__)
 
@@ -36,6 +46,9 @@ log = logging.getLogger(__name__)
 # (read_netlist -> check_netlist_static -> maybe run_simulation); a model that wants 12
 # rounds is stuck, and each round costs tokens.
 MAX_TOOL_ROUNDS = 12
+
+# Required by the API, and it has to leave room for thinking tokens as well as the answer.
+MAX_TOKENS = 16000
 
 SYSTEM_PROMPT = """\
 You are an expert analog circuit engineer helping debug LTspice circuits.
@@ -73,17 +86,17 @@ class ToolExecutor(Protocol):
 
 
 class LLMError(RuntimeError):
-    """A call to the chat API failed in a way worth showing the user."""
+    """A call to the model failed in a way worth showing the user."""
 
 
-def mcp_tools_to_openai(mcp_tools: Iterable[Any]) -> list[dict[str, Any]]:
-    """Translate MCP tool definitions into the OpenAI `tools` array.
+def mcp_tools_to_anthropic(mcp_tools: Iterable[Any]) -> list[dict[str, Any]]:
+    """Map MCP tool definitions onto Anthropic's `tools` parameter.
 
-    MCP Python objects are snake_case (`input_schema`), unlike the wire format. Tools
-    arrive from `client.list_tools()` as objects, but dicts are accepted too so tests
-    can pass literals.
+    Barely a translation: MCP Python objects are already snake_case (`input_schema`),
+    which is the name Anthropic uses too. Tools arrive from `client.list_tools()` as
+    objects, but dicts are accepted so tests can pass literals.
     """
-    translated: list[dict[str, Any]] = []
+    mapped: list[dict[str, Any]] = []
     for tool in mcp_tools:
         if isinstance(tool, dict):
             name = tool.get("name")
@@ -100,20 +113,16 @@ def mcp_tools_to_openai(mcp_tools: Iterable[Any]) -> list[dict[str, Any]]:
             log.warning("skipping a tool with no name: %r", tool)
             continue
 
-        translated.append(
+        mapped.append(
             {
-                "type": "function",
-                "function": {
-                    "name": name,
-                    "description": description,
-                    # An empty-but-valid object schema, because some providers reject
-                    # a function whose parameters are null.
-                    "parameters": schema
-                    or {"type": "object", "properties": {}},
-                },
+                "name": name,
+                "description": description,
+                # input_schema is required, not optional - a tool without one is
+                # rejected outright, so the empty-but-valid object is load-bearing.
+                "input_schema": schema or {"type": "object", "properties": {}},
             }
         )
-    return translated
+    return mapped
 
 
 @dataclass
@@ -143,13 +152,15 @@ class AgentResult:
     output_tokens: int = 0
 
 
-class TamuClient:
-    """Thin HTTP client for the TAMU chat completions endpoint."""
+class BedrockClient:
+    """Thin wrapper over AnthropicBedrock, and the one place errors become LLMError."""
 
     def __init__(self, config: Config, *, timeout: float = 180.0) -> None:
         self._config = config
-        self._timeout = timeout
-        self._http = requests.Session()
+        # Credentials are left to the SDK's default chain on purpose - see config.py.
+        self._client = AnthropicBedrock(
+            aws_region=config.aws_region, timeout=timeout
+        )
 
     @property
     def model(self) -> str:
@@ -160,74 +171,87 @@ class TamuClient:
         messages: list[dict[str, Any]],
         *,
         tools: list[dict[str, Any]] | None = None,
-        max_tokens: int | None = None,
-    ) -> dict[str, Any]:
-        """One chat completion. Returns the raw OpenAI-shaped response body."""
-        payload: dict[str, Any] = {
-            "model": self._config.model,
-            "messages": messages,
-            # Not a default on this proxy - see the module docstring.
-            "stream": False,
-        }
-        if tools:
-            payload["tools"] = tools
-            payload["tool_choice"] = "auto"
-        if max_tokens is not None:
-            payload["max_tokens"] = max_tokens
-
+        system: str = SYSTEM_PROMPT,
+        max_tokens: int = MAX_TOKENS,
+    ) -> Any:
+        """One turn. Returns the SDK's Message object."""
         try:
-            response = self._http.post(
-                self._config.chat_completions_url,
-                headers={
-                    "accept": "application/json",
-                    "Content-Type": "application/json",
-                    "Authorization": f"Bearer {self._config.api_key}",
-                },
-                json=payload,
-                timeout=self._timeout,
+            return self._client.messages.create(
+                model=self._config.model,
+                max_tokens=max_tokens,
+                system=system,
+                messages=messages,
+                tools=tools or anthropic.NOT_GIVEN,
             )
-        except requests.RequestException as exc:
-            raise LLMError(f"Could not reach the chat API: {exc}") from exc
-
-        if response.status_code >= 400:
-            # The body carries the proxy's own explanation, which is usually the
-            # actual diagnosis (a rejected key, an unknown model, tools unsupported).
-            detail = response.text[:1000]
+        except (anthropic.NotFoundError, anthropic.PermissionDeniedError) as exc:
+            # By far the most likely first-run failure, and the SDK's own message does not
+            # say what to do about it. Both shapes mean the same thing in practice.
             raise LLMError(
-                f"Chat API returned HTTP {response.status_code}.\n{detail}"
-            )
-
-        try:
-            body = response.json()
-        except ValueError as exc:
-            content_type = response.headers.get("content-type", "?")
-            raise LLMError(
-                f"Chat API returned {content_type} rather than JSON, so there is no "
-                f"usage block to log.\n{response.text[:500]}"
+                f"Bedrock will not serve {self._config.model} in "
+                f"{self._config.aws_region}.\n\n"
+                "Either the inference profile does not exist in that region or the "
+                "account has not been granted access to it. Check with "
+                "`python scripts/list_bedrock_models.py`, then enable the model in the "
+                "Bedrock console or set SPICE_MCP_AWS_REGION to a region where it is "
+                f"enabled.\n\n{exc}"
             ) from exc
+        except anthropic.AuthenticationError as exc:
+            raise LLMError(
+                "Bedrock rejected the credentials "
+                f"({self._config.credentials_source}).\n\n{exc}"
+            ) from exc
+        except anthropic.APIError as exc:
+            raise LLMError(f"The Bedrock call failed: {exc}") from exc
+        except Exception as exc:
+            # botocore raises its own exceptions during credential resolution and SigV4
+            # signing, before the anthropic layer sees anything.
+            raise LLMError(f"Could not reach Bedrock: {exc}") from exc
 
-        if not body.get("choices"):
-            raise LLMError(f"Chat API returned no choices: {json.dumps(body)[:500]}")
-        return body
+
+def _block_field(block: Any, name: str) -> Any:
+    """Read a field from a content block, tolerating dicts as well as SDK objects."""
+    if isinstance(block, Mapping):
+        return block.get(name)
+    return getattr(block, name, None)
 
 
-def _message_text(message: dict[str, Any]) -> str:
-    """Extract text from a message, tolerating content-part lists."""
-    content = message.get("content")
+def _response_text(response: Any) -> str:
+    """Join the visible text of a response, skipping thinking and tool_use blocks."""
+    content = _block_field(response, "content")
     if isinstance(content, str):
         return content
-    if isinstance(content, list):
-        parts = [
-            part.get("text", "")
-            for part in content
-            if isinstance(part, dict) and part.get("type") == "text"
-        ]
-        return "".join(parts)
-    return ""
+    if not content:
+        return ""
+    parts = [
+        _block_field(block, "text") or ""
+        for block in content
+        if _block_field(block, "type") == "text"
+    ]
+    return "".join(parts)
+
+
+def append_user_note(history: list[dict[str, Any]], text: str) -> None:
+    """Add user-role text to the history without creating two consecutive user turns.
+
+    The Messages API rejects consecutive same-role messages, so a note the app wants the
+    model to see - "the user opened this circuit", "the user approved your fix" - cannot
+    simply be appended: the next question would append a second user turn behind it and
+    the request would be refused. Folding it into the pending turn keeps the note intact
+    and the history valid, and means callers never have to think about ordering.
+    """
+    if history and history[-1].get("role") == "user":
+        content = history[-1].get("content")
+        if isinstance(content, str):
+            history[-1]["content"] = f"{content}\n\n{text}"
+            return
+        if isinstance(content, list):
+            content.append({"type": "text", "text": text})
+            return
+    history.append({"role": "user", "content": text})
 
 
 def run_agent_turn(
-    client: TamuClient,
+    client: BedrockClient,
     session: Session,
     user_text: str,
     *,
@@ -238,17 +262,16 @@ def run_agent_turn(
 ) -> AgentResult:
     """Run one user turn to completion, executing tool calls as the model asks.
 
-    `history` is the running OpenAI-format message list and is mutated in place, so the
-    caller keeps conversational context across turns. The session log is updated as
+    `history` is the running Messages-API message list and is mutated in place, so the
+    caller keeps conversational context across turns. The system prompt is *not* in
+    there - it is a top-level parameter on every request. The session log is updated as
     each turn completes rather than at the end, so an interrupted session still leaves
     complete token counts behind.
     """
     if history is None:
         history = []
-    if not history or history[0].get("role") != "system":
-        history.insert(0, {"role": "system", "content": SYSTEM_PROMPT})
 
-    history.append({"role": "user", "content": user_text})
+    append_user_note(history, user_text)
     session.add_turn(Turn(role="user", text=user_text))
 
     records: list[ToolCallRecord] = []
@@ -256,58 +279,72 @@ def run_agent_turn(
     total_out = 0
 
     for round_index in range(1, MAX_TOOL_ROUNDS + 1):
-        body = client.complete(history, tools=tools)
-        message = body["choices"][0]["message"]
-        usage = body.get("usage") or {}
-        total_in += int(usage.get("prompt_tokens") or 0)
-        total_out += int(usage.get("completion_tokens") or 0)
+        response = client.complete(history, tools=tools)
+        usage = _block_field(response, "usage")
+        total_in += int(usage_value(usage, "input_tokens") or 0)
+        total_out += int(usage_value(usage, "output_tokens") or 0)
 
-        text = _message_text(message)
-        tool_calls = message.get("tool_calls") or []
+        text = _response_text(response)
+        stop_reason = _block_field(response, "stop_reason")
+        content = _block_field(response, "content") or []
+        tool_uses = [b for b in content if _block_field(b, "type") == "tool_use"]
 
-        # Append the assistant message verbatim: the provider needs its own tool_calls
-        # structure back unchanged to match the tool results to it.
-        history.append(message)
+        # Append the content verbatim: the tool_use blocks have to come back unchanged for
+        # the results to match up, and so do any thinking blocks alongside them.
+        history.append({"role": "assistant", "content": content})
 
         round_records: list[ToolCallRecord] = []
-        for call in tool_calls:
-            function = call.get("function") or {}
-            name = function.get("name") or "?"
-            raw_args = function.get("arguments") or "{}"
-            try:
-                arguments = json.loads(raw_args) if raw_args.strip() else {}
-            except json.JSONDecodeError as exc:
-                arguments = {}
-                result = f"Your arguments were not valid JSON ({exc}). Raw: {raw_args}"
+        results: list[dict[str, Any]] = []
+        for block in tool_uses:
+            name = _block_field(block, "name") or "?"
+            # The API parses tool input for us, so this is a dict in practice. The check is
+            # not decoration: the approval gate in api.py reads arguments.get("apply"), and
+            # a non-dict would make that check silently pass, so never hand one onward.
+            raw_input = _block_field(block, "input")
+            valid_input = isinstance(raw_input, Mapping)
+            arguments = dict(raw_input) if valid_input else {}
+
+            if not valid_input:
+                log.warning("tool %s sent non-dict input: %r", name, raw_input)
+                result = (
+                    f"Your input for {name} was not an object. Send the arguments as "
+                    "a JSON object and try again."
+                )
+                is_error = True
+            elif tool_executor is None:
+                result = "No tools are available in this session."
                 is_error = True
             else:
-                if tool_executor is None:
-                    result = "No tools are available in this session."
+                if on_progress:
+                    on_progress(
+                        f"{name}({', '.join(f'{k}={v!r}' for k, v in arguments.items())})"
+                    )
+                try:
+                    result = tool_executor(name, arguments)
+                    is_error = False
+                except Exception as exc:
+                    # Hand the failure to the model rather than aborting: a bad path or
+                    # an unsupported file is something it can recover from by calling the
+                    # tool differently.
+                    log.warning("tool %s failed: %s", name, exc)
+                    result = f"Tool {name} failed: {exc}"
                     is_error = True
-                else:
-                    if on_progress:
-                        on_progress(f"{name}({', '.join(f'{k}={v!r}' for k, v in arguments.items())})")
-                    try:
-                        result = tool_executor(name, arguments)
-                        is_error = False
-                    except Exception as exc:
-                        # Hand the failure to the model rather than aborting: a bad
-                        # path or an unsupported file is something it can recover from
-                        # by calling the tool differently.
-                        log.warning("tool %s failed: %s", name, exc)
-                        result = f"Tool {name} failed: {exc}"
-                        is_error = True
 
             record = ToolCallRecord(name, arguments, result, is_error)
             round_records.append(record)
             records.append(record)
-            history.append(
+            results.append(
                 {
-                    "role": "tool",
-                    "tool_call_id": call.get("id"),
+                    "type": "tool_result",
+                    "tool_use_id": _block_field(block, "id"),
                     "content": result,
+                    "is_error": is_error,
                 }
             )
+
+        if results:
+            # One message carrying every result from this round. Splitting them is rejected.
+            history.append({"role": "user", "content": results})
 
         session.add_turn(
             Turn.from_usage(
@@ -320,7 +357,13 @@ def run_agent_turn(
         for record in round_records:
             session.add_turn(Turn(role="tool", text=record.result))
 
-        if not tool_calls:
+        if stop_reason != "tool_use":
+            if stop_reason == "max_tokens":
+                # Say so rather than presenting a truncated diagnosis as a finished one.
+                text = (
+                    f"{text}\n\n[Cut off at the {MAX_TOKENS}-token limit, so this answer "
+                    "is incomplete. Try asking a narrower question.]"
+                ).strip()
             return AgentResult(
                 text=text,
                 tool_calls=records,

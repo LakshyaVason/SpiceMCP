@@ -15,7 +15,10 @@ fixture is never modified - the fixture has to stay broken to be worth anything.
 simulates cleanly, and is still out of spec by 10x. Nothing but circuit reasoning finds
 it, so a pass here exercises the model rather than the parser.
 
-Makes real API calls, so it costs tokens. Exit code 0 means every stage passed.
+Makes real Bedrock calls, so it costs real money on the configured AWS account - not just
+tokens against a prepaid allowance. Needs credentials that resolve and model access granted
+in the configured region; run `scripts/list_bedrock_models.py` first if either is in doubt.
+Exit code 0 means every stage passed.
 """
 
 from __future__ import annotations

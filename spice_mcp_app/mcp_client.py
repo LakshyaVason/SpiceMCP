@@ -38,9 +38,19 @@ log = logging.getLogger(__name__)
 # tokens. Truncate defensively; the model can ask for a narrower view.
 MAX_RESULT_CHARS = 60_000
 
-# Withheld from the server subprocess. These are the app half's business only, and the key
-# in particular has no reason to exist in a process that knows nothing about LLMs.
-_LLM_ONLY_ENV = frozenset({"TAMU_API_KEY", "SPICE_MCP_MODEL", "SPICE_MCP_BASE_URL"})
+# Withheld from the server subprocess. These are the app half's business only, and the AWS
+# credentials in particular have no reason to exist in a process that knows nothing about LLMs.
+#
+# The AWS side is denied by *prefix*, not by name. An enumerated list would have to be kept in
+# step with the credential chain - AWS_SESSION_TOKEN, AWS_PROFILE, AWS_ROLE_ARN,
+# AWS_WEB_IDENTITY_TOKEN_FILE, AWS_CONTAINER_CREDENTIALS_*, AWS_BEARER_TOKEN_BEDROCK - and the
+# failure mode of missing one is silent: the secret travels and the test still passes.
+_LLM_ONLY_ENV = frozenset({"SPICE_MCP_MODEL", "SPICE_MCP_AWS_REGION"})
+_LLM_ONLY_PREFIXES = ("AWS_",)
+
+
+def _is_llm_only(name: str) -> bool:
+    return name in _LLM_ONLY_ENV or name.startswith(_LLM_ONLY_PREFIXES)
 
 
 class MCPClientError(RuntimeError):
@@ -60,14 +70,14 @@ def _server_params() -> StdioServerParameters:
     inside the server anyway.
 
     Extended minus the LLM variables, though. The server must never learn what an LLM is,
-    and that is not only an architectural line: forwarding TAMU_API_KEY would hand the key
-    to a process with no use for it, widening its exposure for nothing.
+    and that is not only an architectural line: forwarding AWS_SECRET_ACCESS_KEY would hand
+    the credential to a process with no use for it, widening its exposure for nothing.
 
     Ordering note: LTSPICE_EXE only reaches os.environ once `load_dotenv` has run inside
     `load_config()`. `Api.__init__` does that before `start()` gets here, so the app path is
     fine; a bare `SpiceMCP()` with no prior `load_config()` would not be.
     """
-    env = {k: v for k, v in os.environ.items() if k not in _LLM_ONLY_ENV}
+    env = {k: v for k, v in os.environ.items() if not _is_llm_only(k)}
     env["SPICE_MCP_LOG_LEVEL"] = os.environ.get("SPICE_MCP_LOG_LEVEL", "INFO")
     # The server's stdout is the MCP wire and its stderr carries LTspice's Ω/µ/°.
     env["PYTHONIOENCODING"] = "utf-8"

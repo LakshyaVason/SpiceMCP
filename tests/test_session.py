@@ -3,7 +3,9 @@
 The log is the deliverable for the external cost comparison, so these tests are about
 the schema being exactly as specified and the token counts being complete. A log that
 is subtly reshaped, or that silently records zeros, would invalidate the comparison
-without failing anything else.
+without failing anything else - which is not hypothetical: the transport migration to
+Bedrock changed the names `usage` arrives under, and nothing but these tests would have
+noticed every count quietly becoming zero.
 """
 
 from __future__ import annotations
@@ -33,22 +35,52 @@ def test_schema_keys_and_order(tmp_path):
     assert list(session.to_dict().keys()) == EXPECTED_KEYS
 
 
-def test_openai_usage_names_are_mapped(tmp_path):
-    """TAMU returns prompt_tokens/completion_tokens; the log must not leak those names."""
+def test_usage_passes_through_and_the_schema_gains_no_keys(tmp_path):
+    """Bedrock already uses the log's own names, so nothing is renamed.
+
+    It also sends `cache_*` counts. Prompt caching is not enabled, and the schema is fixed
+    by an external cost comparison, so those must not appear - a log that quietly grew a
+    key would break the comparison without breaking anything else.
+    """
     session = make_session(tmp_path)
     session.add_turn(
         Turn.from_usage(
             "assistant",
             "hello",
-            {"prompt_tokens": 120, "completion_tokens": 34, "total_tokens": 154},
+            {
+                "input_tokens": 120,
+                "output_tokens": 34,
+                "cache_read_input_tokens": 0,
+                "cache_creation_input_tokens": 0,
+            },
         )
     )
 
     turn = session.to_dict()["turns"][0]
     assert turn["input_tokens"] == 120
     assert turn["output_tokens"] == 34
-    assert "prompt_tokens" not in turn
-    assert "completion_tokens" not in turn
+    assert list(turn.keys()) == ["role", "text", "input_tokens", "output_tokens"]
+
+
+def test_a_usage_object_is_read_as_well_as_a_dict(tmp_path):
+    """The SDK hands back a pydantic Usage, not a dict; both have to work.
+
+    Converting to a dict up front would be the obvious simplification and is exactly what
+    must not happen - it would make a genuinely absent count indistinguishable from zero
+    and silence the warning below.
+    """
+
+    class SdkUsage:
+        input_tokens = 77
+        output_tokens = 12
+        cache_read_input_tokens = 5
+
+    session = make_session(tmp_path)
+    session.add_turn(Turn.from_usage("assistant", "hello", SdkUsage()))
+
+    turn = session.to_dict()["turns"][0]
+    assert (turn["input_tokens"], turn["output_tokens"]) == (77, 12)
+    assert "cache_read_input_tokens" not in turn
 
 
 def test_missing_usage_warns_but_does_not_crash(tmp_path, caplog):

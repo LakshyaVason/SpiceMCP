@@ -38,36 +38,56 @@ To pick the environment back up in a later session, that middle line is the one 
 (In Git Bash it is `source .venv/Scripts/activate`; in PowerShell,
 `.venv\Scripts\Activate.ps1`.)
 
-Then copy `.env.example` to `.env` and fill in your key:
+- **AWS credentials with Bedrock access.** The LLM is Claude on **Amazon Bedrock**, so
+  auth is IAM-based — there is no API key for this app to hold. Anything the standard AWS
+  chain can find works: `aws configure`, `AWS_PROFILE`, `AWS_ACCESS_KEY_ID` /
+  `AWS_SECRET_ACCESS_KEY` (plus `AWS_SESSION_TOKEN` for temporary credentials), an instance
+  role, or an `AWS_BEARER_TOKEN_BEDROCK` if your organisation issued one instead.
+
+Then copy `.env.example` to `.env`:
 
 ```bat
 copy .env.example .env
 ```
 
-`.env` is git-ignored. **No key ever goes in source.**
+Every setting in it is optional — if your credentials already resolve, the defaults
+(`us.anthropic.claude-opus-5` in `us-east-1`) work as shipped. `.env` is git-ignored, and
+**no credential ever enters the app's config object**, so there is nothing for a stray debug
+print to leak: the AWS SDK reads the environment itself and the app only records *which
+style* of credential it found.
 
 ## Choosing a model
 
-The TAMU AI Chat proxy is OpenAI-compatible. List what it actually offers:
+`SPICE_MCP_MODEL` is a Bedrock **inference profile id**, not a display name — e.g.
+`us.anthropic.claude-opus-5`. The `us.` prefix routes across US regions; `global.` is the
+same model without the geographic restriction and is billed about **10% cheaper**, which is
+worth noting in any cost write-up so the number is not read as base pricing.
+
+Profile availability is **region-scoped** and gated on model access being granted to your
+account, so list what you actually have before relying on anything:
 
 ```bat
-python scripts\list_tamu_models.py
+python scripts\list_bedrock_models.py
 ```
 
-This script deliberately lives outside the app's dependency tree — it needs only
-`requests` (`pip install -r scripts\requirements.txt`) so it can be run without the full
-app environment. Put your chosen model id in `SPICE_MCP_MODEL` in `.env`.
+That prints the Claude inference profiles and Anthropic foundation models visible in the
+resolved region, and flags whether the app's default is among them. It calls Bedrock's
+control plane only, so it is **free**. Like the other scripts it lives outside the app's
+dependency tree — `pip install -r scripts\requirements.txt` is enough to run it.
 
-Model ids from this proxy can contain spaces (`protected.Claude Opus 4.8`). That is normal.
-
-The app needs the model to support **tool calling**. To check one before relying on it:
+The app needs the model to support **tool use**. To prove a real round trip end to end:
 
 ```bat
 python scripts\probe_tool_calling.py
 ```
 
-Three stages — a plain completion with usage, a `tool_calls` emission, and a `role:"tool"`
-round trip. It costs a few tokens. `protected.Claude Opus 4.8` passes all three.
+Three stages — a plain completion with non-zero usage, a genuine `tool_use` block with
+parsed input, and a `tool_result` reply that closes the loop with `stop_reason: "end_turn"`.
+This one sends real requests, so it costs real money on your AWS account. Run
+`list_bedrock_models.py` first if either credentials or model access is in doubt.
+
+Set `SPICE_MCP_AWS_REGION` in `.env` to move regions; it falls back to `AWS_REGION`, then
+`AWS_DEFAULT_REGION`, then `us-east-1`.
 
 ## Running the app
 
@@ -228,11 +248,17 @@ GUI — which is the whole point of patching the `.asc` rather than a netlist.
 python -m pytest
 ```
 
-211 tests, ~29s. Parser and static-check tests run without LTspice installed; schematic
+225 tests, ~40s. Parser and static-check tests run without LTspice installed; schematic
 tests skip automatically if the executable is not found. Nothing in the suite calls the
-network, so running it costs no tokens — the live-model checks are the two scripts,
+network, so running it costs nothing — the live-model checks are the two scripts,
 `probe_tool_calling.py` and `app_smoke.py` (a headless nine-stage end-to-end run against
 a temp copy of `wrong_value_lowpass.asc`).
+
+Staying free is enforced, not hoped for: an autouse fixture strips every `AWS_*` and
+`SPICE_MCP_*` variable, points `HOME`/`USERPROFILE` at a temp directory so `~/.aws` cannot
+be found, and neuters `.env` loading. Otherwise the AWS credential chain would happily
+succeed from somewhere no test mentions — making a "credentials are missing" test pass on a
+bare laptop and fail on a configured one, or letting a mis-wired test spend real money.
 
 The fixture matrix in `tests/test_checks.py` asserts the **exact** set of checks each
 circuit produces. Equality rather than membership is deliberate: it makes the suite a
@@ -281,9 +307,9 @@ spice_mcp_server/   MCP server. Knows nothing about LLMs.
   asc.py            byte-preserving .asc value patching
   diff.py           before/after circuit comparison
 spice_mcp_app/      desktop UI + LLM client + MCP client
-  config.py         key/model/base-url resolution; redacts the key for logs
+  config.py         model/region/credential-style resolution; holds no credential
   session.py        the token log; atomic write after every turn
-  llm.py            TAMU client, MCP→OpenAI schema translation, agent loop
+  llm.py            Bedrock client, MCP→Anthropic tool mapping, agent loop
   mcp_client.py     stdio client; holds one server subprocess open
   api.py            the JS bridge — and the approval gate
   launch.py         the Explorer entry point: opens LTspice, then the window
@@ -300,11 +326,10 @@ reused by any MCP host and later retargeted at other EDA tools.
 
 ## Session logs
 
-Each debug session writes `sessions/<uuid>.json` with per-turn token counts. TAMU returns
-OpenAI-shaped `prompt_tokens`/`completion_tokens`; these are mapped to
-`input_tokens`/`output_tokens` on the way in so the log schema stays stable. Cost
+Each debug session writes `sessions/<uuid>.json` with per-turn token counts. Cost
 comparison against the old screenshot workflow is done **externally** — the app only
-records, it does not analyse.
+records, it does not analyse. With Bedrock the per-call charges also land in CloudWatch and
+Cost Explorer, so the log and the bill can be reconciled against each other.
 
 ```json
 {
@@ -319,15 +344,20 @@ The file is rewritten atomically after **every** turn, so a crash mid-session st
 complete log. `tool_calls` is present only on turns that made them. `resolved` is the
 **Mark resolved** button — it is how you tell, later, which sessions actually ended in a fix.
 
-One wrinkle worth knowing if you point this at another OpenAI-compatible proxy: requests
-must send `"stream": false` explicitly. The TAMU proxy otherwise replies with an event
-stream **and omits the `usage` block entirely**, which would leave every token count null
-without anything visibly failing.
+The schema is fixed by that external comparison, so it deliberately does **not** grow keys:
+Bedrock also reports `cache_read_input_tokens` and `cache_creation_input_tokens`, and since
+prompt caching is not enabled they are dropped rather than logged. An assistant turn that
+arrives with no usage at all is logged as zero **and warned about** — a silently null count
+would under-report cost without anything visibly failing.
 
 ## Notes for future work
 
 - `mcp` must stay `>=2.1`. The 2.x API (`MCPServer`, return-annotation-derived schemas) is
   a rewrite; most tutorials online target v1 and will not run.
+- **Never send a `thinking` parameter.** Adaptive thinking is on by default for Opus 5;
+  `budget_tokens` is rejected with a 400, and explicitly *disabling* thinking makes the model
+  occasionally write a tool call into its visible text rather than emitting a `tool_use`
+  block — which is the exact failure this transport was migrated to fix.
 - `.gitattributes` exempts `*.asc`/`*.asy`/`*.net` from EOL normalisation. `RCLP.asc` is
   bare-LF while `RCLP.net` is CRLF, and `text=auto` would rewrite schematic bytes.
 - `-I<path>` must be the **last** LTspice argument, after the filename, with no space.
