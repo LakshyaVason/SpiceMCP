@@ -1,9 +1,20 @@
-"""Bedrock client, MCP->Anthropic tool mapping, and the agent loop.
+"""Gateway client, MCP->Anthropic tool mapping, and the agent loop.
 
-The transport is AWS Bedrock through `anthropic.AnthropicBedrock`, which speaks the
-native Messages API. That means tool calling needs no translation layer: an MCP tool
-definition is already `{name, description, input_schema}`, which is exactly what
-Anthropic's `tools` parameter wants.
+The transport is the **TAMU AI Gateway's** Anthropic-shaped endpoint, reached with
+`anthropic.Anthropic(base_url=..., auth_token=...)`, which resolves to
+`POST {base_url}/v1/messages` and authenticates with `Authorization: Bearer`. No AWS
+credentials, no region, no boto3: the gateway holds the upstream provider relationship and
+this client holds one token.
+
+Because the endpoint speaks the native Messages API, tool calling needs no translation
+layer: an MCP tool definition is already `{name, description, input_schema}`, which is
+exactly what Anthropic's `tools` parameter wants.
+
+**The endpoint matters more than the model.** The same gateway also exposes
+`/v1/chat/completions`, and on that path the very same model accepts an OpenAI-shaped
+`tools` array and then answers as though it had none - narrating the call in visible text
+while the turn "succeeds". `/v1/messages` returns real `tool_use` blocks; that difference
+is the whole reason this module targets the path it does.
 
 Facts about this transport that the code depends on:
 
@@ -26,13 +37,14 @@ Facts about this transport that the code depends on:
 There are two tool-calling modes, selected by `SPICE_MCP_TOOL_MODE`:
 
   * **`native`** (the default) sends the `tools` parameter and reads `tool_use` blocks
-    back. This is what Bedrock's Messages API supports properly, and the reason the app
-    moved onto it.
+    back. Verified live against the gateway's `/v1/messages` by
+    `scripts/probe_tool_calling.py`.
   * **`prompted_json`** puts the tool catalogue in the system prompt and asks for one
     JSON object per reply. It exists for routes that accept `tools` and then ignore it -
-    not hypothetical: the retired TAMU gateway did exactly that, and the symptom was the
-    model *narrating* a tool call in its visible text while the turn "succeeded". A
-    session log with no `tool_calls` key on any turn is that failure.
+    not hypothetical, and not a retired concern: it is what this same gateway's
+    `/v1/chat/completions` path does with this same model. The symptom is the model
+    *narrating* a tool call in its visible text while the turn "succeeds". A session log
+    with no `tool_calls` key on any turn is that failure.
 
 The mode is explicit configuration rather than a guess from the model id, because the
 behaviour belongs to a route (a model reached through an endpoint), not to a name.
@@ -47,18 +59,21 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any, Callable, Iterable, Protocol
 
 import anthropic
-from anthropic import AnthropicBedrock
+from anthropic import Anthropic
 
 from .config import (
+    TOKEN_ENV_VAR,
     TOOL_MODE_NATIVE,
     TOOL_MODE_PROMPTED_JSON,
     TOOL_MODES,
     Config,
+    ConfigError,
 )
 from .session import Session, Turn, usage_value
 
@@ -154,9 +169,10 @@ PROMPTED_CORRECTION = (
 # A truncated reply is unparseable for a reason the generic correction misdiagnoses: the
 # JSON was well-formed until the output cap cut it off mid-string, and telling the model
 # its JSON was invalid would have it hunt for a syntax error it never made. Observed live
-# on the retired gateway, which capped a reply at 1024 tokens when `max_tokens` was
-# omitted. Bedrock cannot do that silently - `max_tokens` is mandatory and MAX_TOKENS is
-# generous - but a long enough answer can still hit the ceiling, so the diagnosis stays.
+# live on the gateway's OpenAI path, which capped a reply at 1024 tokens when `max_tokens`
+# was omitted. The Messages API cannot do that silently - `max_tokens` is mandatory and
+# MAX_TOKENS is generous - but a long enough answer can still hit the ceiling, so the
+# diagnosis stays.
 PROMPTED_TRUNCATED = (
     "PROTOCOL ERROR\nYour reply hit the output length limit part-way through the JSON, "
     "so it could not be parsed and nothing was run. Send the same object again but "
@@ -265,8 +281,8 @@ def prompted_protocol_prompt(tools: Iterable[dict[str, Any]] | None) -> str:
 def prompted_system_prompt(tools: Iterable[dict[str, Any]] | None) -> str:
     """The full system prompt for prompted mode.
 
-    Built per request rather than stored, because Bedrock has no system *role*: the
-    system prompt is a top-level parameter on every call, so there is nowhere in the
+    Built per request rather than stored, because the Messages API has no system *role*:
+    the system prompt is a top-level parameter on every call, so there is nowhere in the
     message history to keep it. A `{"role": "system"}` message is a 400.
     """
     return SYSTEM_PROMPT + "\n\n" + prompted_protocol_prompt(tools)
@@ -405,14 +421,29 @@ class AgentResult:
     protocol_errors: int = 0
 
 
-class BedrockClient:
-    """Thin wrapper over AnthropicBedrock, and the one place errors become LLMError."""
+class GatewayClient:
+    """Thin wrapper over the gateway's Messages endpoint, and the one place errors
+    become LLMError.
+
+    The bearer token is read from the environment *here* rather than carried on `Config`,
+    which is what keeps `Config` free of secrets - see config.py. `auth_token=` makes the
+    SDK send `Authorization: Bearer <token>` and omit `x-api-key`, matching what the
+    gateway expects. It is held only on the SDK client; this object exposes no attribute
+    carrying it.
+    """
 
     def __init__(self, config: Config, *, timeout: float = 180.0) -> None:
         self._config = config
-        # Credentials are left to the SDK's default chain on purpose - see config.py.
-        self._client = AnthropicBedrock(
-            aws_region=config.aws_region, timeout=timeout
+        token = (os.environ.get(TOKEN_ENV_VAR) or "").strip()
+        if not token:
+            # Reachable when a caller built a Config with require_credentials=False and
+            # then tried to talk to the model anyway. Better here than as a 401.
+            raise ConfigError(
+                f"{TOKEN_ENV_VAR} is not set, so {config.messages_url} cannot be "
+                "reached."
+            )
+        self._client = Anthropic(
+            base_url=config.base_url, auth_token=token, timeout=timeout
         )
 
     @property
@@ -438,29 +469,33 @@ class BedrockClient:
                 tools=tools or anthropic.NOT_GIVEN,
                 stop_sequences=stop_sequences or anthropic.NOT_GIVEN,
             )
-        except (anthropic.NotFoundError, anthropic.PermissionDeniedError) as exc:
-            # By far the most likely first-run failure, and the SDK's own message does not
-            # say what to do about it. Both shapes mean the same thing in practice.
+        except anthropic.NotFoundError as exc:
+            # A 404 from the gateway is about its routing table, not about this machine.
+            # Worth saying so: the SDK's own message reads like a broken URL.
             raise LLMError(
-                f"Bedrock will not serve {self._config.model} in "
-                f"{self._config.aws_region}.\n\n"
-                "Either the inference profile does not exist in that region or the "
-                "account has not been granted access to it. Check with "
-                "`python scripts/list_bedrock_models.py`, then enable the model in the "
-                "Bedrock console or set SPICE_MCP_AWS_REGION to a region where it is "
-                f"enabled.\n\n{exc}"
+                f"The gateway did not route {self._config.model!r}.\n\n"
+                "Either it does not offer that model id or this token is not entitled "
+                "to it. Set SPICE_MCP_MODEL in .env to an id the gateway serves.\n\n"
+                f"Endpoint: {self._config.messages_url}\n\n{exc}"
             ) from exc
-        except anthropic.AuthenticationError as exc:
+        except (anthropic.AuthenticationError, anthropic.PermissionDeniedError) as exc:
+            # Split from the 404 on purpose - the two used to share a branch because on
+            # Bedrock both meant "no model access", but here they mean different things
+            # and send the reader to different places.
             raise LLMError(
-                "Bedrock rejected the credentials "
-                f"({self._config.credentials_source}).\n\n{exc}"
+                f"The gateway rejected the credential "
+                f"({self._config.credentials_source}).\n\n"
+                f"Check that {TOKEN_ENV_VAR} in .env is current and entitled to "
+                f"{self._config.model}.\n\n{exc}"
+            ) from exc
+        except anthropic.APIConnectionError as exc:
+            raise LLMError(
+                f"Could not reach {self._config.messages_url}.\n\n"
+                "The request never got an HTTP status back, so this is a network or VPN "
+                f"problem rather than a configuration one.\n\n{exc}"
             ) from exc
         except anthropic.APIError as exc:
-            raise LLMError(f"The Bedrock call failed: {exc}") from exc
-        except Exception as exc:
-            # botocore raises its own exceptions during credential resolution and SigV4
-            # signing, before the anthropic layer sees anything.
-            raise LLMError(f"Could not reach Bedrock: {exc}") from exc
+            raise LLMError(f"The gateway call failed: {exc}") from exc
 
 
 def _block_field(block: Any, name: str) -> Any:
@@ -514,7 +549,7 @@ def _execute_tool(
 
 
 def _usage_tokens(usage: Any) -> tuple[int, int]:
-    """Round totals from a Bedrock usage block, tolerating dicts and SDK objects."""
+    """Round totals from a usage block, tolerating dicts and SDK objects."""
     return (
         int(usage_value(usage, "input_tokens") or 0),
         int(usage_value(usage, "output_tokens") or 0),
@@ -586,7 +621,7 @@ def append_user_note(history: list[dict[str, Any]], text: str) -> None:
 
 
 def run_agent_turn(
-    client: BedrockClient,
+    client: GatewayClient,
     session: Session,
     user_text: str,
     *,
@@ -627,7 +662,7 @@ def run_agent_turn(
 
 
 def _run_native_turn(
-    client: BedrockClient,
+    client: GatewayClient,
     session: Session,
     tools: list[dict[str, Any]] | None,
     tool_executor: ToolExecutor | None,
@@ -714,7 +749,7 @@ def _run_native_turn(
 
 
 def _run_prompted_turn(
-    client: BedrockClient,
+    client: GatewayClient,
     session: Session,
     tools: list[dict[str, Any]] | None,
     tool_executor: ToolExecutor | None,
@@ -726,8 +761,8 @@ def _run_prompted_turn(
     `tools` is deliberately *not* sent on the request here: on such a route it is dead
     weight in the prompt budget, and sending it would make a failure ambiguous between
     "the model ignored it" and "the model chose not to use it". The catalogue goes into
-    the system prompt instead, which Bedrock takes as a top-level parameter on every
-    call - there is no system *role* to put it in the history once.
+    the system prompt instead, which the Messages API takes as a top-level parameter on
+    every call - there is no system *role* to put it in the history once.
     """
     known = tool_names(tools)
     system = prompted_system_prompt(tools)

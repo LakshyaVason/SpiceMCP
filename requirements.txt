@@ -15,11 +15,13 @@ spicelib>=1.6.3,<2
 # Desktop window for the app (uses the OS webview; no Node/Electron toolchain).
 pywebview>=6.2
 
-# Claude on AWS Bedrock, via the native Messages API. The [bedrock] extra pulls in
-# boto3/botocore for credential resolution and SigV4 signing. 1.x needs httpx2, not httpx.
-anthropic[bedrock]>=1.3,<2
+# Claude through the TAMU AI Gateway's Anthropic Messages endpoint. Plain `anthropic`, with
+# no extras: the [bedrock] extra pulls boto3/botocore for credential resolution and SigV4
+# signing, and this app has no AWS identity to resolve - the gateway handles the upstream
+# provider and authenticates us with one bearer token. 1.x needs httpx2, not httpx.
+anthropic>=1.3,<2
 
-# Loads SPICE_MCP_* and any AWS_* credentials from a git-ignored .env.
+# Loads TAMU_API_KEY and SPICE_MCP_* from a git-ignored .env.
 python-dotenv>=1.0
 
 # Process handling: killing a hung LTspice batch run, and detecting a running LTspice GUI

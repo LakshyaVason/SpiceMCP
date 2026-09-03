@@ -4,7 +4,7 @@ The log is the deliverable for the external cost comparison, so these tests are 
 the schema being exactly as specified and the token counts being complete. A log that
 is subtly reshaped, or that silently records zeros, would invalidate the comparison
 without failing anything else - which is not hypothetical: the transport migration to
-Bedrock changed the names `usage` arrives under, and nothing but these tests would have
+The transport decides the names `usage` arrives under, and nothing but these tests would have
 noticed every count quietly becoming zero.
 """
 
@@ -36,7 +36,7 @@ def test_schema_keys_and_order(tmp_path):
 
 
 def test_usage_passes_through_and_the_schema_gains_no_keys(tmp_path):
-    """Bedrock already uses the log's own names, so nothing is renamed.
+    """The Messages API already uses the log's own names, so nothing is renamed.
 
     It also sends `cache_*` counts. Prompt caching is not enabled, and the schema is fixed
     by an external cost comparison, so those must not appear - a log that quietly grew a

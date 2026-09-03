@@ -1,7 +1,7 @@
 # Standalone deps for the sibling benchmark/utility scripts.
 #
 # These are intentionally kept out of the app's dependency tree: the token-usage
-# comparison runs externally, so these scripts only need a Bedrock client.
+# comparison runs externally, so these scripts only need an Anthropic client.
 #
 #   python -m venv scripts/.venv
 #   scripts\.venv\Scripts\activate
@@ -10,6 +10,10 @@
 # (The project .venv at the repo root already satisfies these, so activating that
 # instead works fine for one-off runs.)
 
-# probe_tool_calling.py talks to Bedrock through the Anthropic SDK; the [bedrock] extra
-# brings boto3/botocore, which is also what list_bedrock_models.py uses directly.
-anthropic[bedrock]>=1.3
+# probe_tool_calling.py talks to the TAMU AI Gateway's /v1/messages endpoint through the
+# Anthropic SDK. No [bedrock] extra: there is no AWS identity to resolve or sign with, so
+# boto3 would be dead weight.
+anthropic>=1.3,<2
+
+# probe_tool_calling.py reads TAMU_API_KEY from the repo's git-ignored .env.
+python-dotenv>=1.0

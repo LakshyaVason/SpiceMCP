@@ -38,11 +38,10 @@ To pick the environment back up in a later session, that middle line is the one 
 (In Git Bash it is `source .venv/Scripts/activate`; in PowerShell,
 `.venv\Scripts\Activate.ps1`.)
 
-- **AWS credentials with Bedrock access.** The LLM is Claude on **Amazon Bedrock**, so
-  auth is IAM-based — there is no API key for this app to hold. Anything the standard AWS
-  chain can find works: `aws configure`, `AWS_PROFILE`, `AWS_ACCESS_KEY_ID` /
-  `AWS_SECRET_ACCESS_KEY` (plus `AWS_SESSION_TOKEN` for temporary credentials), an instance
-  role, or an `AWS_BEARER_TOKEN_BEDROCK` if your organisation issued one instead.
+- **A TAMU AI Gateway token.** The LLM is Claude reached through the
+  [TAMU AI Gateway](https://gateway.api.tamu.ai), which handles authentication and billing
+  and talks to the model provider on its own side. One bearer token in `TAMU_API_KEY` is the
+  whole requirement: **no AWS account, no AWS credentials, no region, no boto3.**
 
 Then copy `.env.example` to `.env`:
 
@@ -50,32 +49,26 @@ Then copy `.env.example` to `.env`:
 copy .env.example .env
 ```
 
-Every setting in it is optional — if your credentials already resolve, the defaults
-(`us.anthropic.claude-opus-5` in `us-east-1`) work as shipped. `.env` is git-ignored, and
-**no credential ever enters the app's config object**, so there is nothing for a stray debug
-print to leak: the AWS SDK reads the environment itself and the app only records *which
-style* of credential it found.
+Only `TAMU_API_KEY` is required; every other setting has a working default
+(`us.anthropic.claude-opus-5` at `https://gateway.api.tamu.ai`). `.env` is git-ignored, and
+**the token never enters the app's config object** — it is read from the environment at the
+moment the SDK client is built, so there is nothing for a stray debug print, a `repr()` or a
+traceback to leak. What the app records is a *label*: `TAMU_API_KEY (48 chars)`, never a
+fingerprint of the value.
 
 ## Choosing a model
 
-`SPICE_MCP_MODEL` is a Bedrock **inference profile id**, not a display name — e.g.
-`us.anthropic.claude-opus-5`. The `us.` prefix routes across US regions; `global.` is the
-same model without the geographic restriction and is billed about **10% cheaper**, which is
-worth noting in any cost write-up so the number is not read as base pricing.
+`SPICE_MCP_MODEL` names the model **the gateway** should route to, and says nothing about
+this machine. `us.anthropic.claude-opus-5` means the gateway reaches Claude via Bedrock on
+its side, using its own account — you need no Bedrock access of your own. The `us.` prefix
+is billed about **10% above** the `global.` equivalent, which is worth noting in any cost
+write-up so the number is not read as base pricing.
 
-Profile availability is **region-scoped** and gated on model access being granted to your
-account, so list what you actually have before relying on anything:
+Usage and spend are the gateway's to report — `GET /v1/tamus/billing` on the same token.
+Nothing in this repo needs to reconcile a bill.
 
-```bat
-python scripts\list_bedrock_models.py
-```
-
-That prints the Claude inference profiles and Anthropic foundation models visible in the
-resolved region, and flags whether the app's default is among them. It calls Bedrock's
-control plane only, so it is **free**. Like the other scripts it lives outside the app's
-dependency tree — `pip install -r scripts\requirements.txt` is enough to run it.
-
-The app needs the model to support **tool use**. To prove a real round trip end to end:
+The app needs the route to support **tool use**, which is a property of the *endpoint* as
+much as the model. To prove a real round trip end to end:
 
 ```bat
 python scripts\probe_tool_calling.py                                  REM native
@@ -84,11 +77,13 @@ python scripts\probe_tool_calling.py <model id> --prompted-json       REM the fa
 
 Three stages — a plain completion with non-zero usage, a genuine `tool_use` block with
 parsed input, and a `tool_result` reply that closes the loop with `stop_reason: "end_turn"`.
-This one sends real requests, so it costs real money on your AWS account. Run
-`list_bedrock_models.py` first if either credentials or model access is in doubt.
+Stage 3 checks the final answer actually contains the value the tool returned, so a model
+that answers from its own imagination fails. This sends real requests, so it spends real
+tokens against your gateway account — a few, not a session's worth. It lives outside the
+app's dependency tree; `pip install -r scripts\requirements.txt` is enough to run it.
 
-Set `SPICE_MCP_AWS_REGION` in `.env` to move regions; it falls back to `AWS_REGION`, then
-`AWS_DEFAULT_REGION`, then `us-east-1`.
+Point `SPICE_MCP_BASE_URL` at a different gateway root if you need to. Leave the version
+segment off: the SDK appends `/v1/messages` itself.
 
 ### Two tool-calling modes
 
@@ -96,13 +91,15 @@ Set `SPICE_MCP_AWS_REGION` in `.env` to move regions; it falls back to `AWS_REGI
 
 | mode | how it works | when |
 | --- | --- | --- |
-| `native` (default) | the MCP tools go in the Messages API `tools` parameter; the model replies with `tool_use` blocks | Bedrock — this is a first-class API feature there |
+| `native` (default) | the MCP tools go in the Messages API `tools` parameter; the model replies with `tool_use` blocks | the gateway's `/v1/messages` route — verified working there |
 | `prompted_json` | the tool catalogue goes in the **system prompt**; the model replies with one JSON object, and results come back framed as `TOOL RESULT` user messages | a route that accepts `tools` and then answers as though it had none |
 
-That second failure is not hypothetical — it is what the retired TAMU gateway did, and it
-is silent: the model narrates the tool call in its visible text, the turn "succeeds", and no
-tool ever runs. `prompted_json` keeps the app working on such a route without pretending the
-native channel is open.
+That second failure is not hypothetical, and it is what makes the endpoint matter more than
+the model: the *same* gateway's `/v1/chat/completions` route, asked for the *same* model,
+accepts a `tools` array and then answers as though it had none. The failure is silent — the
+model narrates the tool call in its visible text, the turn "succeeds", and no tool ever runs.
+`prompted_json` keeps the app working on such a route without pretending the native channel
+is open.
 
 The mode is **explicit configuration, never inferred from a model name.** A misspelling is
 rejected at startup rather than falling back to the default, because falling back is exactly
@@ -278,17 +275,17 @@ GUI — which is the whole point of patching the `.asc` rather than a netlist.
 python -m pytest
 ```
 
-272 tests, ~40s. Parser and static-check tests run without LTspice installed; schematic
+288 tests, ~42s. Parser and static-check tests run without LTspice installed; schematic
 tests skip automatically if the executable is not found. Nothing in the suite calls the
 network, so running it costs nothing — the live-model checks are the two scripts,
 `probe_tool_calling.py` and `app_smoke.py` (a headless nine-stage end-to-end run against
 a temp copy of `wrong_value_lowpass.asc`).
 
-Staying free is enforced, not hoped for: an autouse fixture strips every `AWS_*` and
-`SPICE_MCP_*` variable, points `HOME`/`USERPROFILE` at a temp directory so `~/.aws` cannot
-be found, and neuters `.env` loading. Otherwise the AWS credential chain would happily
-succeed from somewhere no test mentions — making a "credentials are missing" test pass on a
-bare laptop and fail on a configured one, or letting a mis-wired test spend real money.
+Staying free is enforced, not hoped for: an autouse fixture deletes `TAMU_API_KEY` (the
+developer's own `.env` holds a live one), strips every `AWS_*` and `SPICE_MCP_*` variable,
+points `HOME`/`USERPROFILE` at a temp directory, and neuters `.env` loading. Without it a
+mis-wired test could reach the live gateway and spend money, and a "credentials are missing"
+test would pass on a fresh checkout while failing on a configured machine.
 
 The fixture matrix in `tests/test_checks.py` asserts the **exact** set of checks each
 circuit produces. Equality rather than membership is deliberate: it makes the suite a
@@ -337,9 +334,9 @@ spice_mcp_server/   MCP server. Knows nothing about LLMs.
   asc.py            byte-preserving .asc value patching
   diff.py           before/after circuit comparison
 spice_mcp_app/      desktop UI + LLM client + MCP client
-  config.py         model/region/credential-style resolution; holds no credential
+  config.py         model/gateway URL/credential-style resolution; holds no credential
   session.py        the token log; atomic write after every turn
-  llm.py            Bedrock client, MCP→Anthropic tool mapping, agent loop
+  llm.py            gateway client, MCP→Anthropic tool mapping, agent loop
   mcp_client.py     stdio client; holds one server subprocess open
   api.py            the JS bridge — and the approval gate
   launch.py         the Explorer entry point: opens LTspice, then the window
@@ -358,8 +355,8 @@ reused by any MCP host and later retargeted at other EDA tools.
 
 Each debug session writes `sessions/<uuid>.json` with per-turn token counts. Cost
 comparison against the old screenshot workflow is done **externally** — the app only
-records, it does not analyse. With Bedrock the per-call charges also land in CloudWatch and
-Cost Explorer, so the log and the bill can be reconciled against each other.
+records, it does not analyse. The gateway reports per-call spend on its own side
+(`GET /v1/tamus/billing`), so the log and the bill can be reconciled against each other.
 
 ```json
 {
@@ -375,7 +372,7 @@ complete log. `tool_calls` is present only on turns that made them. `resolved` i
 **Mark resolved** button — it is how you tell, later, which sessions actually ended in a fix.
 
 The schema is fixed by that external comparison, so it deliberately does **not** grow keys:
-Bedrock also reports `cache_read_input_tokens` and `cache_creation_input_tokens`, and since
+`usage` also carries `cache_read_input_tokens` and `cache_creation_input_tokens`, and since
 prompt caching is not enabled they are dropped rather than logged. An assistant turn that
 arrives with no usage at all is logged as zero **and warned about** — a silently null count
 would under-report cost without anything visibly failing.

@@ -3,7 +3,7 @@
 All offline: `FakeClient` returns canned Messages-API responses. The loop's job is to keep
 asking until the model stops requesting tools, feed results back in the shape the API
 expects, and record usage for every round - none of which needs a network to verify, and
-all of which would be expensive and flaky to test against live Bedrock.
+all of which would be expensive and flaky to test against the live gateway.
 
 The fakes are **objects, not dicts**, because that is what the SDK returns; `_block_field`
 tolerates both, and one test below covers the dict path deliberately.
@@ -41,7 +41,7 @@ from spice_mcp_app.llm import (
     MAX_PROTOCOL_CORRECTIONS,
     MAX_TOOL_ROUNDS,
     SYSTEM_PROMPT,
-    BedrockClient,
+    GatewayClient,
     LLMError,
     ProtocolError,
     append_user_note,
@@ -570,7 +570,7 @@ def test_a_prompted_tool_request_reaches_the_executor_and_its_result_reaches_the
     assert result.protocol_errors == 0
 
     # The API field is not used in this mode - the catalogue is in the system prompt,
-    # which Bedrock takes on every call because there is no system role to hold it.
+    # which the Messages API takes on every call because there is no system role to hold it.
     assert client.calls[0]["tools"] is None
     assert "TOOL PROTOCOL" in client.calls[0]["system"]
     assert "TOOL PROTOCOL" in client.calls[1]["system"], "the protocol was sent only once"
@@ -727,7 +727,7 @@ def test_a_reply_cut_off_at_the_output_ceiling_is_diagnosed_as_such(session):
     """The JSON was fine until the cap; "your JSON is invalid" is a misdiagnosis.
 
     Seen live on the retired gateway, which silently capped a reply at 1024 tokens
-    mid-string. Bedrock cannot cap silently, but a long enough answer still can, and
+    mid-string. The Messages API cannot cap silently, but a long enough answer still can, and
     telling the model to hunt for a syntax error it never made wastes a whole round.
     """
     client = FakeClient(
@@ -1023,9 +1023,14 @@ def test_a_note_folds_into_a_pending_block_list_too():
 # --- error translation ----------------------------------------------------------------
 
 
-def _bedrock_client_raising(exc, fake_config):
-    """A BedrockClient whose transport raises, without constructing a real one."""
-    client = object.__new__(BedrockClient)
+def _gateway_client_raising(exc, fake_config):
+    """A GatewayClient whose transport raises, without constructing a real one.
+
+    `object.__new__` skips `__init__`, which is what keeps this offline: the real
+    constructor reads TAMU_API_KEY and builds an SDK client, and the autouse fixture has
+    deliberately removed the token.
+    """
+    client = object.__new__(GatewayClient)
     client._config = fake_config
 
     class Boom:
@@ -1038,31 +1043,85 @@ def _bedrock_client_raising(exc, fake_config):
     return client
 
 
-def test_an_unavailable_model_says_which_region_and_what_to_do(fake_config):
-    """The most likely first-run failure, and the SDK's own message does not explain it."""
-    response = httpx2.Response(
-        404, request=httpx2.Request("POST", "https://bedrock.invalid/x")
+def _response(status):
+    return httpx2.Response(
+        status, request=httpx2.Request("POST", "https://gateway.invalid/v1/messages")
     )
-    client = _bedrock_client_raising(
-        anthropic.NotFoundError("no such model", response=response, body=None), fake_config
+
+
+def test_an_unrouted_model_says_it_is_the_gateway_and_names_the_model(fake_config):
+    """A 404 here is the gateway's routing table, not a broken URL or a missing AWS grant.
+
+    The old message sent the reader to the Bedrock console and to a boto3 helper script.
+    On this transport that advice is not merely stale, it is unreachable - the user has no
+    AWS access at all - so the wording is asserted, not just the exception type.
+    """
+    client = _gateway_client_raising(
+        anthropic.NotFoundError("no such model", response=_response(404), body=None),
+        fake_config,
     )
 
     with pytest.raises(LLMError) as caught:
         client.complete([{"role": "user", "content": "hi"}])
 
-    assert "us-east-1" in str(caught.value)
-    assert "fake-model" in str(caught.value)
-    assert "list_bedrock_models" in str(caught.value)
+    message = str(caught.value)
+    assert "fake-model" in message
+    assert "gateway" in message.lower()
+    assert "SPICE_MCP_MODEL" in message
+    # No AWS advice, ever: there is no console to visit and no region to change.
+    assert "region" not in message.lower()
+    assert "bedrock" not in message.lower()
+    assert "aws" not in message.lower()
 
 
-def test_a_botocore_failure_becomes_an_llm_error(fake_config):
-    """Credential resolution and SigV4 signing raise before the anthropic layer sees it."""
-    client = _bedrock_client_raising(RuntimeError("Unable to locate credentials"), fake_config)
+@pytest.mark.parametrize(
+    "exc_type", [anthropic.AuthenticationError, anthropic.PermissionDeniedError]
+)
+def test_a_rejected_token_names_the_variable_but_never_its_value(fake_config, exc_type):
+    """401 and 403 both mean "this token will not do", and point at the same fix.
+
+    They shared a branch with the 404 on the previous transport, where all three meant
+    "no model access". Here they do not, so they are separated.
+    """
+    status = 401 if exc_type is anthropic.AuthenticationError else 403
+    client = _gateway_client_raising(
+        exc_type("nope", response=_response(status), body=None), fake_config
+    )
 
     with pytest.raises(LLMError) as caught:
         client.complete([{"role": "user", "content": "hi"}])
 
-    assert "Unable to locate credentials" in str(caught.value)
+    message = str(caught.value)
+    assert "TAMU_API_KEY" in message
+    # The label may appear; the token itself must not exist anywhere to appear from.
+    assert "TAMU_API_KEY (9 chars)" in message
+
+
+def test_an_unreachable_gateway_is_named_as_a_network_problem(fake_config):
+    """Distinct from a rejected token: nothing to fix in .env, so do not send them there."""
+    client = _gateway_client_raising(
+        anthropic.APIConnectionError(request=httpx2.Request("POST", "https://x/")),
+        fake_config,
+    )
+
+    with pytest.raises(LLMError) as caught:
+        client.complete([{"role": "user", "content": "hi"}])
+
+    message = str(caught.value)
+    assert "https://gateway.invalid/v1/messages" in message
+    assert "network" in message.lower()
+
+
+def test_a_generic_api_error_still_becomes_an_llm_error(fake_config):
+    """The UI only catches LLMError; anything narrower would surface as a raw traceback."""
+    client = _gateway_client_raising(
+        anthropic.BadRequestError("bad", response=_response(400), body=None), fake_config
+    )
+
+    with pytest.raises(LLMError) as caught:
+        client.complete([{"role": "user", "content": "hi"}])
+
+    assert "bad" in str(caught.value)
 
 
 def test_llm_error_is_the_type_the_ui_catches():
@@ -1268,13 +1327,15 @@ def test_a_long_finding_list_is_capped_in_the_model_context(tmp_path):
 
 
 def test_missing_credentials_is_reported_not_raised(tmp_path):
-    """No AWS setup must surface in the UI banner, not crash the window on open.
+    """A missing token must surface in the UI banner, not crash the window on open.
 
-    The autouse `isolated_aws_environment` fixture is what makes this a real test: it
-    removes every `AWS_*` variable and moves `~` to a temp directory, so the chain has
-    genuinely nothing to find even on a machine that is configured for AWS.
+    The autouse `isolated_credential_environment` fixture is what makes this a real test:
+    it removes `TAMU_API_KEY` and neuters `load_dotenv`, so the token is genuinely absent
+    even on this machine, whose `.env` holds a live one.
     """
     started = Api().start()
 
     assert started["ok"] is False
-    assert "AWS_ACCESS_KEY_ID" in started["error"]
+    assert "TAMU_API_KEY" in started["error"]
+    # The banner has to say where to put it, or it is not actionable.
+    assert ".env" in started["error"]

@@ -15,9 +15,10 @@ fixture is never modified - the fixture has to stay broken to be worth anything.
 simulates cleanly, and is still out of spec by 10x. Nothing but circuit reasoning finds
 it, so a pass here exercises the model rather than the parser.
 
-Makes real Bedrock calls, so it costs real money on the configured AWS account - not just
-tokens against a prepaid allowance. Needs credentials that resolve and model access granted
-in the configured region; run `scripts/list_bedrock_models.py` first if either is in doubt.
+Makes real calls through the TAMU AI Gateway, so it spends real tokens against the
+account behind `TAMU_API_KEY`. Run `scripts/probe_tool_calling.py` first if either the
+token or the model id is in doubt - it costs a few tokens instead of a full session and
+tells you which tool mode the route actually supports.
 Exit code 0 means every stage passed.
 """
 

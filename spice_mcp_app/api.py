@@ -24,7 +24,7 @@ from spice_mcp_server.ltspice import ltspice_is_running
 from .config import Config, ConfigError, load_config
 from .llm import (
     AgentResult,
-    BedrockClient,
+    GatewayClient,
     LLMError,
     append_user_note,
     mcp_tools_to_anthropic,
@@ -65,7 +65,7 @@ class Api:
                 self._config_error = str(exc)
 
         self._mcp: SpiceMCP | None = None
-        self._client: BedrockClient | None = None
+        self._client: GatewayClient | None = None
         self._session: Session | None = None
         self._tools: list[dict[str, Any]] = []
         self._history: list[dict[str, Any]] = []
@@ -134,7 +134,7 @@ class Api:
             self._tools = mcp_tools_to_anthropic(mcp_tools)
 
         if self._client is None:
-            self._client = BedrockClient(self._config)
+            self._client = GatewayClient(self._config)
 
         if self._session is None:
             self._session = Session(

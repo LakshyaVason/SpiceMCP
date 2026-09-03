@@ -95,7 +95,7 @@ window.addEventListener("pywebviewready", async () => {
     return;
   }
 
-  /* The tool mode is shown only when it is not the OpenAI-native one, because that is
+  /* The tool mode is surfaced only when it is not the default, because the fallback is
      the case where a wrong setting looks like a working app that never calls a tool. */
   const mode = started.tool_mode === "prompted_json" ? " · prompted JSON tools" : "";
   $("model").textContent = `${started.model} · ${started.tools.length} tools${mode}`;

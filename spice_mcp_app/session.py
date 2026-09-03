@@ -20,15 +20,15 @@ it is not ours to improve:
 
 Two things to keep in mind:
 
-  * Bedrock returns `usage.input_tokens` / `usage.output_tokens` - already the schema's
-    own names, so `Turn.from_usage` no longer renames anything. What it still does, and
-    must keep doing, is **warn when an assistant turn arrives without usage**: silently
-    null counts once let a whole session log look complete while under-reporting
+  * The Messages API returns `usage.input_tokens` / `usage.output_tokens` - already the
+    schema's own names, so `Turn.from_usage` no longer renames anything. What it still
+    does, and must keep doing, is **warn when an assistant turn arrives without usage**:
+    silently null counts once let a whole session log look complete while under-reporting
     everything, and that is the failure mode this log exists to rule out.
-  * `usage` also carries `cache_read_input_tokens` / `cache_creation_input_tokens` on
-    Bedrock. Prompt caching is not enabled, so those are ignored - the schema above is
-    fixed by an external comparison and must not gain keys. If caching is ever turned on,
-    the comparison needs revisiting before this log does.
+  * `usage` also carries `cache_read_input_tokens` / `cache_creation_input_tokens`.
+    Prompt caching is not enabled, so those are ignored - the schema above is fixed by an
+    external comparison and must not gain keys. If caching is ever turned on, the
+    comparison needs revisiting before this log does.
   * The file is rewritten after every turn. A session that crashes mid-debug still
     leaves a usable log, which matters because a crashed session is exactly the kind
     we want token numbers for.

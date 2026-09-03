@@ -30,7 +30,7 @@ from typing import Any
 
 from mcp import Client, StdioServerParameters
 
-from .config import REPO_ROOT
+from .config import REPO_ROOT, TOKEN_ENV_VAR
 
 log = logging.getLogger(__name__)
 
@@ -38,15 +38,26 @@ log = logging.getLogger(__name__)
 # tokens. Truncate defensively; the model can ask for a narrower view.
 MAX_RESULT_CHARS = 60_000
 
-# Withheld from the server subprocess. These are the app half's business only, and the AWS
-# credentials in particular have no reason to exist in a process that knows nothing about LLMs.
+# Withheld from the server subprocess. These are the app half's business only, and the
+# gateway token in particular has no reason to exist in a process that knows nothing about
+# LLMs - forwarding it would widen the credential's exposure for no benefit.
 #
-# The AWS side is denied by *prefix*, not by name. An enumerated list would have to be kept in
-# step with the credential chain - AWS_SESSION_TOKEN, AWS_PROFILE, AWS_ROLE_ARN,
-# AWS_WEB_IDENTITY_TOKEN_FILE, AWS_CONTAINER_CREDENTIALS_*, AWS_BEARER_TOKEN_BEDROCK - and the
-# failure mode of missing one is silent: the secret travels and the test still passes.
+# TOKEN_ENV_VAR is *imported* rather than spelled out again: the same name has to appear in
+# config.py, and a rename that updated one copy and not the other would leak the token
+# while every test still passed.
+#
+# The AWS_ prefix rule is kept even though this app no longer uses AWS. It costs nothing,
+# and if a user's shell happens to carry AWS credentials for unrelated work there is still
+# no reason to hand them to the netlist parser. It is belt-and-braces, not the load-bearing
+# rule - a period when it *was* the only rule is exactly when TOKEN_ENV_VAR went missing
+# from this set and the token started reaching the server.
 _LLM_ONLY_ENV = frozenset(
-    {"SPICE_MCP_MODEL", "SPICE_MCP_AWS_REGION", "SPICE_MCP_TOOL_MODE"}
+    {
+        TOKEN_ENV_VAR,
+        "SPICE_MCP_MODEL",
+        "SPICE_MCP_BASE_URL",
+        "SPICE_MCP_TOOL_MODE",
+    }
 )
 _LLM_ONLY_PREFIXES = ("AWS_",)
 
@@ -72,8 +83,8 @@ def _server_params() -> StdioServerParameters:
     inside the server anyway.
 
     Extended minus the LLM variables, though. The server must never learn what an LLM is,
-    and that is not only an architectural line: forwarding AWS_SECRET_ACCESS_KEY would hand
-    the credential to a process with no use for it, widening its exposure for nothing.
+    and that is not only an architectural line: forwarding the gateway token would hand the
+    credential to a process with no use for it, widening its exposure for nothing.
 
     Ordering note: LTSPICE_EXE only reaches os.environ once `load_dotenv` has run inside
     `load_config()`. `Api.__init__` does that before `start()` gets here, so the app path is

@@ -31,49 +31,53 @@ needs_ltspice = pytest.mark.skipif(
 
 
 @pytest.fixture(autouse=True)
-def isolated_aws_environment(monkeypatch, tmp_path):
-    """Cut every route the AWS chain has to real credentials, for every test.
+def isolated_credential_environment(monkeypatch, tmp_path):
+    """Cut every route to a real credential, for every test.
 
-    Not defensive tidiness - the suite is specified to be offline and free, and Bedrock's
-    credential resolution is designed to succeed from places no test mentions: ambient
-    `AWS_*` variables, `~/.aws/credentials`, an SSO cache, an instance role. Left alone,
-    a "credentials are missing" test would pass on a laptop with no AWS setup and fail on
-    the developer's machine that has one, and a mis-wired test could reach the live API
-    and spend money.
+    Not defensive tidiness - the suite is specified to be offline and free. The gateway
+    token is the one that matters now: the developer's `.env` holds a live `TAMU_API_KEY`,
+    so without this a mis-wired test could reach the live API and spend money, and a
+    "credentials are missing" test would pass on a fresh checkout and fail here.
 
-    `HOME`/`USERPROFILE` move to tmp_path so `Path.home() / ".aws"` cannot exist, and
-    `load_dotenv` is neutered so the repo's own git-ignored `.env` - which does hold real
-    settings - never leaks into a test. Tests that want a credential set one explicitly.
+    The `AWS_*` sweep is kept even though the app no longer uses AWS. A shell may carry
+    those for unrelated work, `tests/test_config.py` asserts they are inert, and the
+    assertion is only meaningful if the fixture is not itself supplying them.
+
+    `HOME`/`USERPROFILE` move to tmp_path so nothing resolves out of the real home
+    directory, and `load_dotenv` is neutered so the repo's own git-ignored `.env` - which
+    does hold real settings - never leaks into a test. Tests that want a credential set one
+    explicitly.
 
     `LTSPICE_EXE` is deliberately left alone: it is not an LLM setting, and the
     `needs_ltspice` tests depend on it.
     """
+    import spice_mcp_app.config as app_config
+
+    monkeypatch.delenv(app_config.TOKEN_ENV_VAR, raising=False)
     for name in list(os.environ):
         if name.startswith("AWS_") or name.startswith("SPICE_MCP_"):
             monkeypatch.delenv(name, raising=False)
     monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.setenv("USERPROFILE", str(tmp_path))
 
-    # Imported here rather than at module scope so the server-half tests do not acquire a
-    # dependency on the app half's packages.
-    import spice_mcp_app.config as app_config
-
     monkeypatch.setattr(app_config, "load_dotenv", lambda *a, **k: None)
 
 
 @pytest.fixture
 def fake_config(tmp_path):
-    """A Config that names no real model, region or account.
+    """A Config that names no real model, gateway or token.
 
     `credentials_source` is a label the UI prints, never a credential - so there is
-    nothing here to leak even if a test dumps it.
+    nothing here to leak even if a test dumps it. The base_url is deliberately not the real
+    gateway: a test that somehow reached the network should fail on DNS rather than
+    quietly succeed against TAMU.
     """
     from spice_mcp_app.config import Config
 
     return Config(
         model="fake-model",
-        aws_region="us-east-1",
-        credentials_source="environment keys",
+        base_url="https://gateway.invalid",
+        credentials_source="TAMU_API_KEY (9 chars)",
         sessions_dir=tmp_path,
     )
 

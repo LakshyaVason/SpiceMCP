@@ -16,15 +16,18 @@ the LTspice GUI, the sim is re-run to confirm, and every turn's token usage is l
 
 ## Hard constraints — do not relax these
 
-1. **No secrets in source — and none in `Config` either.** Bedrock auth is IAM-based, so
-   there is no bearer key for this app to hold: credentials are resolved by the AWS default
-   chain *inside the SDK*. `Config` carries `model`, `aws_region`, a `credentials_source`
-   **label** and `sessions_dir`, and nothing else — so there is nothing for a stray debug
-   print or a `repr()` in a traceback to leak, by construction rather than by filtering.
-   `redacted()` reports which *style* of credential was found ("environment keys",
-   "profile:x"), never its value; `tests/test_config.py` sweeps its output for the secret.
-   `.env` (git-ignored) may hold `AWS_*` variables as a convenience; `.env.example`
-   documents all three styles as optional.
+1. **No secrets in source — and none in `Config` either.** Auth is one bearer token,
+   `TAMU_API_KEY`, and `Config` deliberately does not hold it: `GatewayClient.__init__`
+   reads it from the environment at the moment it builds the SDK client and keeps it only
+   inside the `Anthropic` instance. `Config` carries `model`, `base_url`, a
+   `credentials_source` **label**, `sessions_dir` and `tool_mode`, and nothing else — so
+   there is nothing for a stray debug print or a `repr()` in a traceback to leak, by
+   construction rather than by filtering. The label is `TAMU_API_KEY (<n> chars)`: enough to
+   distinguish "set" from "truncated paste", and deliberately **not** a last-four
+   fingerprint — four characters of a live token are still four characters of a live token.
+   `tests/test_config.py` sweeps `redacted()` and `repr()` with a **sliding 4-character
+   window** over a fake token, differenced against a no-token baseline so a coincidental
+   match in the hostname or repo path cannot be reported as a leak.
 2. **Never write into the user's source directory.** LTspice writes `-netlist` and `-b`
    output *next to the input file*, so every invocation stages the input into
    `%TEMP%\spice_mcp_work\` first. This is not hypothetical: an ad-hoc shell command during
@@ -52,11 +55,17 @@ the LTspice GUI, the sim is re-run to confirm, and every turn's token usage is l
 - Name: "SPICE MCP client". Repo stays `SpiceMCP`.
 - Python-only desktop app (pywebview/PySide). No Electron, no Node toolchain.
 - `spicelib` is an accepted dependency; no from-scratch parser.
-- LLM is **Claude on AWS Bedrock**, via `anthropic.AnthropicBedrock` and the native Messages
-  API. Chosen over the TAMU AI Gateway (retired 2026-09-01) because the deliverable is a cost
-  comparison and Bedrock bills per call through CloudWatch/Cost Explorer, where TAMU only
-  showed a cumulative dashboard. `AnthropicBedrockMantle` and `AnthropicAWS` were considered
-  and declined — `AnthropicBedrock` reaches Opus 5 and is what the brief specified.
+- LLM is **Claude reached through the TAMU AI Gateway** (`https://gateway.api.tamu.ai`),
+  via `anthropic.Anthropic(base_url=…, auth_token=…)` and the native Messages API. The
+  gateway owns authentication *and* billing; it routes to a model provider on its own side.
+  The architecture is:
+  `app → TAMU gateway /v1/messages → us.anthropic.claude-opus-5 → Bedrock, TAMU-side`.
+  **The user has no AWS account, no AWS credentials, no region and no Bedrock console
+  access, and the app must never require any of them.** `AnthropicBedrock` is therefore
+  wrong here and must not be reintroduced; nor may boto3 return as a dependency. A previous
+  version of this file claimed the gateway was "retired 2026-09-01" — **that was false**,
+  and it is what sent an entire round of work into a direct-Bedrock rewrite that could not
+  possibly run on this machine.
 - Two-process MCP split over local stdio. The server **must never learn what an LLM is** —
   that's what makes it reusable for the later EDA-tool work.
 
@@ -131,14 +140,23 @@ MCP tool — it is a UX detail the model never needs, and an eighth tool schema 
 for in every request. `tests/test_write_conflict.py` asserts the tool set is still exactly
 seven.
 
-### Bedrock / Messages API facts
+### Gateway / Messages API facts
 
-The transport was OpenAI-shaped until 2026-09-01. The failure that forced the migration is
-worth keeping in mind, because it is silent: given an OpenAI `tools` array a Claude model
-**narrates the tool call as prose in its visible text** — the turn "succeeds", no call runs,
-and nothing raises. `sessions/beda7b77-….json` is the evidence (no `tool_calls` on any turn,
-assistant text containing raw `antml:invoke` syntax and an invented netlist). A session log
-with no `tool_calls` key is the symptom to look for.
+**The endpoint matters more than the model.** The gateway exposes both
+`POST /v1/messages` (Anthropic-shaped) and `POST /v1/chat/completions` (OpenAI-shaped), and
+the *path* decides the wire format while the model id only decides which backend the gateway
+routes to. The app used the OpenAI path until 2026-09-01, and the failure that forced the
+move is worth keeping in mind because it is silent: given an OpenAI `tools` array a Claude
+model **narrates the tool call as prose in its visible text** — the turn "succeeds", no call
+runs, and nothing raises. `sessions/beda7b77-….json` is the evidence (no `tool_calls` on any
+turn, assistant text containing raw `antml:invoke` syntax and an invented netlist). A session
+log with no `tool_calls` key is the symptom to look for.
+
+**Verified live 2026-09-02:** native `tool_use` works on `/v1/messages` with
+`us.anthropic.claude-opus-5` — `stop_reason: "tool_use"`, content blocks
+`['text', 'tool_use']`, and a final answer built from the value the `tool_result` supplied.
+`prompted_json` passes through the same route too. So the old failure was never the model
+refusing to call tools; it was the endpoint.
 
 - **`max_tokens` is required on every request.** There is no default. `MAX_TOKENS = 16000`,
   sized to leave room for thinking tokens as well as the answer.
@@ -162,30 +180,36 @@ with no `tool_calls` key is the symptom to look for.
   the gate would fail *open*.
 - **There is no system *role*.** The system prompt is a top-level `system=` parameter, sent on
   every request. A `{"role": "system"}` message in the history is a 400.
-- **`SPICE_MCP_MODEL` is a Bedrock inference profile id**, not a display name — and it is
-  region-scoped. `us.anthropic.claude-opus-5` is billed at a **10% premium** over
+- **`SPICE_MCP_MODEL` names what the *gateway* routes to**, not anything on this machine.
+  `us.anthropic.claude-opus-5` is billed at a **10% premium** over
   `global.anthropic.claude-opus-5`; say so in the cost write-up so the number is not read as
-  base pricing. `scripts\list_bedrock_models.py` lists what the account actually has.
-- Bedrock does **not** offer server-side web search/fetch, code execution, the Batches/Files
-  APIs, or Agent Skills. Messages, streaming, tool use, adaptive thinking, prompt caching and
-  token counting all work. None of the missing pieces are used here.
+  base pricing. Spend is the gateway's to report: `GET /v1/tamus/billing` on the same token.
+- **`SPICE_MCP_BASE_URL` must not carry a version segment.** The SDK appends `/v1/messages`
+  itself, so a pasted `…/v1` yields `/v1/v1/messages` — which 404s, and a 404 from the
+  gateway reads like a missing model, putting the diagnosis a long way from the cause.
+  `config.py:_normalize_base_url` trims a trailing `/v1`, `/openai` or `/api`.
+- The gateway does **not** offer server-side web search/fetch, code execution, the
+  Batches/Files APIs, or Agent Skills. Messages, tool use, adaptive thinking and token
+  counting all work. None of the missing pieces are used here.
 - **`SYMATTR Value2` is a trap.** `RCLP.asc`'s `V1` has both `Value` and `Value2` (`AC 0.7
   3000`). A `startswith("Value")` match patches the wrong line, so `asc.py` tokenises the
   attribute name.
 
 ### Two tool-calling modes — `SPICE_MCP_TOOL_MODE`
 
-`native` (the default, and the right answer on Bedrock) sends the MCP tools in the `tools`
-parameter and reads back `tool_use` blocks. `prompted_json` puts the catalogue in the system
-prompt, has the model reply with **one JSON object**, and frames results as `TOOL RESULT`
-user messages. It exists because a route can accept `tools` and then answer as though it had
-none — what the retired TAMU gateway did to `us.anthropic.claude-opus-5`, silently. Both live
-in `llm.py`; `run_agent_turn` dispatches on the config value.
+`native` (the default, and verified live on the gateway's `/v1/messages`) sends the MCP tools
+in the `tools` parameter and reads back `tool_use` blocks. `prompted_json` puts the catalogue
+in the system prompt, has the model reply with **one JSON object**, and frames results as
+`TOOL RESULT` user messages. It exists because a route can accept `tools` and then answer as
+though it had none — which is what the *same* gateway's `/v1/chat/completions` does to
+`us.anthropic.claude-opus-5`, silently. Both live in `llm.py`; `run_agent_turn` dispatches on
+the config value.
 
 - **The mode is explicit configuration, never inferred from a model name.** A typo raises
   `ConfigError` rather than falling back to native: a silent fallback is precisely the failure
-  the setting exists to catch. Only `us.anthropic.claude-opus-5` on the TAMU gateway was ever
-  observed ignoring `tools` — don't generalise that to other `us.anthropic` profiles.
+  the setting exists to catch. The observation that produced this setting was about an
+  *endpoint*, not a model family — don't restate it as "`us.anthropic` profiles ignore
+  `tools`", because on `/v1/messages` that same profile honours them.
 - **The approval gate covers both modes.** Both converge on `llm.py:_execute_tool`, which
   calls the executor `api.py` supplies, so `prompted_json` buys the model no extra reach.
   `tests/test_llm.py::test_no_tool_mode_can_write_without_approval` is parametrized over both.
@@ -195,8 +219,8 @@ in `llm.py`; `run_agent_turn` dispatches on the config value.
   which becomes a correction message to the model — never an execution. Regex-scanning text
   for `antml:invoke` markup was explicitly ruled out by the user; do not reintroduce it.
 - A malformed reply costs a re-ask, bounded by `MAX_PROTOCOL_CORRECTIONS = 2`. The correction
-  goes through `append_user_note`, not a second user message — Bedrock rejects consecutive
-  same-role turns, and a `TOOL RESULT` message may already be pending.
+  goes through `append_user_note`, not a second user message — the Messages API rejects
+  consecutive same-role turns, and a `TOOL RESULT` message may already be pending.
 - `stop_sequences=PROMPTED_STOP` (`["TOOL RESULT"]`) stops the model role-playing the tool's
   reply. It has been seen fabricating a result and an answer quoting it; anything after the
   first JSON object is discarded with a warning, which is the safe direction.
@@ -262,24 +286,30 @@ into. Names starting with `_` are skipped, and objects can opt out with
 
 ```bat
 .venv\Scripts\activate
-python -m pytest                        REM 272 tests, ~40s
+python -m pytest                        REM 288 tests, ~42s
 python -m spice_mcp_app                 REM the desktop app; --folder fixtures --debug
 python -m spice_mcp_app --file fixtures\wrong_value_lowpass.asc   REM one circuit, pre-checked
 python -m spice_mcp_app.launch fixtures\wrong_value_lowpass.asc --no-ltspice
 python -m spice_mcp_server              REM stdio server; sits waiting for a client
 python scripts\install_context_menu.py  REM right-click verb; --status / --uninstall
-python scripts\list_bedrock_models.py   REM inference profiles + model access; free
-python scripts\probe_tool_calling.py    REM 3-stage Bedrock check; --prompted-json for the
+python scripts\probe_tool_calling.py    REM 3-stage gateway check; --prompted-json for the
                                         REM other tool mode. Costs a few tokens.
 python scripts\app_smoke.py             REM headless end-to-end, no window; costs money
 ```
+
+`scripts\list_bedrock_models.py` is a **leftover from the direct-Bedrock detour** and cannot
+work here: it imports boto3 and calls the Bedrock control plane with AWS credentials that do
+not exist on this machine. It is the only boto3 importer left in the repo and nothing imports
+it. It stays only because deleting a tracked file needs the user's say-so — ask before
+removing it, and do not treat it as a live diagnostic. The gateway equivalent of "what can I
+reach?" is `scripts\probe_tool_calling.py`.
 
 Prefix Python invocations with `PYTHONIOENCODING=utf-8` — LTspice output contains `Ω`, `µ`
 and `°`, which crash a cp1252 console.
 
 `.mcp.json` registers the server so it can be driven from Claude Code directly.
 
-## State: Steps 0–8, the Explorer launcher, and the Bedrock migration; 272 tests pass
+## State: Steps 0–8, the Explorer launcher, and the gateway migration; 288 tests pass
 
 **Server half — `spice_mcp_server/`, seven tools**, all verified over a real MCP stdio
 handshake. It still knows nothing about LLMs.
@@ -298,9 +328,9 @@ Modules: `models.py` (pydantic schemas), `netlist.py`, `checks.py`, `logparse.py
 `ltspice.py` (staged invocation), `asc.py` (byte-preserving patcher), `diff.py`.
 
 **App half — `spice_mcp_app/`.** The only half that knows what an LLM is.
-`config.py` (env/`.env`, region + model + credential *label*, no secret), `session.py` (the
-spec'd log, atomic write per turn), `llm.py` (Bedrock client, MCP→Anthropic tool mapping,
-bounded agent loop),
+`config.py` (env/`.env`, gateway URL + model + credential *label*, no secret), `session.py`
+(the spec'd log, atomic write per turn), `llm.py` (`GatewayClient`, MCP→Anthropic tool
+mapping, bounded agent loop),
 `mcp_client.py` (stdio client holding one server subprocess open), `api.py` (JS bridge +
 **the approval gate**), `web/` (single-window UI), `__main__.py`, `launch.py` (the Explorer
 entry point). Plus `spice_mcp_launch.py` at the repo root — a one-line shim so the registry
@@ -327,24 +357,31 @@ starts with the cwd set to the user's circuit folder:
   against the cwd it would have scattered session logs into the user's source directory.
 - `mcp_client.py` passed `env=` as a **replacement** dict, so `LTSPICE_EXE` never reached the
   server despite `.env.example` documenting that it would. It now merges over `os.environ`
-  minus the LLM-only variables — `SPICE_MCP_MODEL`, `SPICE_MCP_AWS_REGION`, and **everything
-  matching the `AWS_` prefix**. The prefix rule replaced an enumerated deny-list on purpose:
-  the chain keeps growing variables (`AWS_ROLE_ARN`, `AWS_WEB_IDENTITY_TOKEN_FILE`,
-  `AWS_CONTAINER_CREDENTIALS_*`, `AWS_BEARER_TOKEN_BEDROCK`) and the failure mode of missing
-  one is silent — the credential travels into a process that knows nothing about LLMs, and the
-  test still passes. `tests/test_config.py` pins both, and asserts the rule with a variable
-  named nowhere in `mcp_client.py`.
+  minus `_LLM_ONLY_ENV` — `TAMU_API_KEY`, `SPICE_MCP_MODEL`, `SPICE_MCP_BASE_URL`,
+  `SPICE_MCP_TOOL_MODE` — plus everything matching the `AWS_` prefix.
+
+  **A real leak lives here.** When the transport briefly moved to direct Bedrock, the explicit
+  `TAMU_API_KEY` deny entry was dropped in favour of the `AWS_` prefix rule, which *looked*
+  like it covered "the credential". It did not: the gateway token then travelled into the MCP
+  server — a process that knows nothing about LLMs and has no use for it — and every test
+  still passed. `_LLM_ONLY_ENV` now imports `TOKEN_ENV_VAR` from `config.py` rather than
+  re-typing the name, so a rename cannot silently miss a copy, and
+  `tests/test_config.py::test_the_server_is_never_given_the_gateway_token` asserts it through
+  the *built* environment rather than by reading the deny-list. The `AWS_` prefix rule is kept
+  as belt-and-braces — the app has no AWS identity, but a shell may carry those for unrelated
+  work and a netlist parser has no business seeing them; `AWS_ROLE_ARN` is in the test on
+  purpose because it is named nowhere in `mcp_client.py`.
 
 ### Session log
 `./sessions/<uuid>.json`, flushed after every turn: `session_id`, `started_at`, `model`,
 `circuit_file`, `turns[]` (each `role`, `text`, optional `tool_calls`, `input_tokens`,
-`output_tokens`), `total_input_tokens`, `total_output_tokens`, `resolved`. Bedrock's `usage`
-already uses `input_tokens`/`output_tokens`, so `Turn.from_usage` renames nothing — what it
-still does, and must keep doing, is **warn when an assistant turn arrives without usage**. It
-reads through `usage_value()` rather than converting `usage` to a dict up front, which is what
-keeps an absent count distinguishable from a zero and the warning reachable. Bedrock also
-sends `cache_read_input_tokens`/`cache_creation_input_tokens`; caching is off and the schema
-is fixed by the external comparison, so those are deliberately dropped.
+`output_tokens`), `total_input_tokens`, `total_output_tokens`, `resolved`. The Messages API's
+`usage` already uses `input_tokens`/`output_tokens`, so `Turn.from_usage` renames nothing —
+what it still does, and must keep doing, is **warn when an assistant turn arrives without
+usage**. It reads through `usage_value()` rather than converting `usage` to a dict up front,
+which is what keeps an absent count distinguishable from a zero and the warning reachable.
+`usage` also carries `cache_read_input_tokens`/`cache_creation_input_tokens`; caching is off
+and the schema is fixed by the external comparison, so those are deliberately dropped.
 
 ### Testing philosophy — keep this
 `tests/test_checks.py` asserts the **exact set** of checks each fixture produces. Equality
@@ -357,14 +394,17 @@ are inconsistent enough that plausible-looking fabricated samples would test the
 
 The suite is offline and free: `tests/test_llm.py` drives the agent loop with a `FakeClient`
 returning canned Messages-API responses. Live-model checks live in `scripts/`, not in
-`pytest`, so running the tests never costs money or depends on Bedrock being reachable.
+`pytest`, so running the tests never costs money or depends on the gateway being reachable.
 
-`tests/conftest.py`'s **autouse `isolated_aws_environment`** is what makes that true now that
-auth is IAM-based. It deletes every `AWS_*` and `SPICE_MCP_*` variable, points `HOME` and
-`USERPROFILE` at `tmp_path` so `~/.aws` cannot exist, and neuters `load_dotenv`. Without it
-the AWS chain succeeds from places no test mentions — ambient env, `~/.aws`, an SSO cache, an
-instance role — so a "credentials are missing" test would pass on a bare laptop and fail on a
-configured one, and a mis-wired test could reach the live API and spend money.
+`tests/conftest.py`'s **autouse `isolated_credential_environment`** is what makes that true.
+It deletes `config.TOKEN_ENV_VAR` first — the developer's own `.env` holds a live
+`TAMU_API_KEY`, so without that a mis-wired test could reach the live gateway and spend money,
+and a "credentials are missing" test would pass on a fresh checkout while failing here. It
+then strips every `AWS_*` and `SPICE_MCP_*` variable, points `HOME`/`USERPROFILE` at
+`tmp_path`, and neuters `load_dotenv`. The `AWS_*` sweep is kept even though the app no longer
+touches AWS: `tests/test_config.py` asserts those variables are *inert*, and that assertion
+only means something if the fixture is not itself supplying them. `LTSPICE_EXE` is deliberately
+left alone — it is not an LLM setting and the `needs_ltspice` tests depend on it.
 
 ### Fixtures pull in different directions on purpose
 `no_dc_path.asc` is caught by the static check but **simulates fine** (exit 0, solves `.op`
@@ -380,13 +420,20 @@ to simulate. `wrong_value_lowpass.asc` passes both and is out of spec by 10× �
 unilaterally; the gate refuses and the file stays byte-identical) → approval → byte fidelity →
 re-simulate → model confirmation → session-log audit.
 
-It passed end to end **on the TAMU transport** (16 turns, 41 996 in / 1 572 out, schema keys
-exactly as specified, no null counts, totals matching). It has **not yet been re-run on
-Bedrock** — no AWS credentials exist on this machine — so that result no longer certifies the
-current transport. Re-running it is the first thing to do once credentials are available, in
-this order: `list_bedrock_models.py` (free) → `probe_tool_calling.py` (a few tokens) →
-`app_smoke.py`. Stages 4/5 are prompt- and model-sensitive and may need re-tuning against Opus
-5's phrasing; a re-tune is fine, **a refusal that does not happen is not**.
+It passed end to end on the gateway's **OpenAI-shaped** route (16 turns, 41 996 in / 1 572
+out, schema keys exactly as specified, no null counts, totals matching). It has **not been
+re-run since the move to `/v1/messages`**, so that result no longer certifies the current
+transport. Run `probe_tool_calling.py` (a few tokens) first, then `app_smoke.py`. Stages 4/5
+are prompt-sensitive and may need re-tuning against Opus 5's phrasing; a re-tune is fine,
+**a refusal that does not happen is not**.
+
+What *is* verified on the current transport, offline: a real `tool_use` block → the approval
+gate in `Api._tool_executor` → MCP → LTspice → the exact planted value coming back in the
+`tool_result` → a final answer built from it. The provenance harness plants a fresh unusual
+value in a temp copy of the schematic each run, so a hallucinated answer cannot pass; the
+planted value is never hardcoded into `pytest`. Both tool modes pass, role alternation is
+correct in both, and the gate refuses an unapproved apply while leaving the file
+byte-identical.
 
 - ✅ Byte fidelity on `patch_component_value` — only the intended line changes, encoding and
   line endings unchanged, and the patched file survives an LTspice `-netlist` round trip and
@@ -419,7 +466,7 @@ part that genuinely needs eyes.
 5. In LTspice: **File ▸ Revert** → `C1` shows the new value in the GUI. ← closes the GUI item.
 6. `python scripts\install_context_menu.py --uninstall` — the entry is gone.
 
-Automated up to that point: 272 tests, plus a headless launcher run verified to reach window
+Automated up to that point: 288 tests, plus a headless launcher run verified to reach window
 creation with `get_initial_folder()` returning the resolved folder and circuit, cwd back at
 the repo root, and nothing written beside the fixture.
 

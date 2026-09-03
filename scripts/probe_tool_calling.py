@@ -1,59 +1,63 @@
-"""Probe whether Bedrock will serve the configured model, with working tool use.
+"""Probe tool calling on the TAMU AI Gateway's Anthropic Messages endpoint.
 
-Native tool use is a documented first-class feature of the Messages API, so the old
-question this script asked - "does the proxy honour `tools` at all?" - is no longer the
-risk. What can still go wrong on Bedrock is all environmental, and all of it fails in
-ways that are easy to misread:
+The gateway exposes two request paths, and *the path decides the wire format* while the
+model id only names the gateway's own backend provider:
 
-  * the inference profile is not enabled in this region, or the account lacks access;
-  * credentials do not resolve, or resolve to the wrong account;
-  * `usage` is absent, which would silently null the session log's token counts.
+    POST {base}/v1/chat/completions   OpenAI-shaped
+    POST {base}/v1/messages           Anthropic-shaped   <- what this probes
+
+`us.anthropic.claude-opus-5` therefore means "the gateway reaches this model via Bedrock
+internally". It does **not** mean this client should hold AWS credentials, and nothing in
+this script touches AWS, boto3 or a region.
+
+The open question this exists to answer: `/v1/chat/completions` was already observed
+returning no OpenAI `tool_calls` for this model, which is why `prompted_json` mode exists
+and was verified live. Does `/v1/messages` do better and return real Anthropic `tool_use`
+blocks? Until this passes, `SPICE_MCP_TOOL_MODE` stays where it is.
 
     .venv\\Scripts\\activate
-    python scripts/probe_tool_calling.py                            # model from .env
-    python scripts/probe_tool_calling.py global.anthropic.claude-opus-5   # or an explicit one
-    python scripts/probe_tool_calling.py global.anthropic.claude-opus-5 --prompted-json
+    python scripts/probe_tool_calling.py                          # model from .env
+    python scripts/probe_tool_calling.py us.anthropic.claude-opus-5
+    python scripts/probe_tool_calling.py --prompted-json          # the fallback mode
 
-Native mode (the default) has three stages, in order, because each is a separate way
-this can let us down:
+Native mode (the default) runs three stages, each a distinct way the route can fail:
 
-  1. a plain completion works at all, and `usage` carries non-zero counts;
-  2. the model emits a real `tool_use` content block when given `tools`, rather than
-     narrating the call in its visible text (the exact bug this migration fixed);
-  3. a `tool_result` block is accepted back and produces a final answer.
+  1. a plain completion works at all, and `usage` carries non-zero token counts;
+  2. given Anthropic-format `tools`, the model emits a real `tool_use` **content block** -
+     not a description of a call in its visible text;
+  3. an Anthropic `tool_result` block is accepted back, and the final answer carries the
+     value only that tool could have supplied.
 
-`--prompted-json` probes the other tool mode instead - the one selected by
-`SPICE_MCP_TOOL_MODE=prompted_json`, where the catalogue goes in the system prompt and
-the model replies with one JSON object. It uses the app's own prompt builder, stop
-sequence and parser rather than copies, so a pass is evidence about the shipping code
-path. Stage 1 is the same plain completion; then:
+`--prompted-json` probes the other mode using the app's own prompt builder, stop sequence
+and parser - not copies - so a pass is evidence about the shipping code path.
 
-  2. `tools` is *not* sent, and `parse_prompted_reply` accepts the reply as a tool call;
-  3. a "TOOL RESULT" user message is accepted back and produces `{"type":"answer"}`
-     carrying the value only the tool could have supplied.
+**The native probe's meaning is fixed.** Stage 2 passes only on a genuine `tool_use`
+block. Prose that merely looks like a tool call is a FAIL, and the bar is not lowered so
+that some model prints PASS. Stage 3's value (`PROBE_VALUE`) is deliberately an odd
+number no one would volunteer, so an answer composed from memory cannot pass either.
 
-**The two are different capabilities and this script keeps them distinguishable.** The
-native probe passes only when a real `tool_use` block arrives; no amount of
-prompted-JSON support makes it pass, and it is not relaxed to suit any model.
+Exit 0 means the probed mode works end to end over the gateway.
 
-Exit code 0 means the probed mode works end to end and the agent loop can proceed.
-Non-zero prints what to change - usually a region or a model-access grant in the Bedrock
-console.
+Authentication reuses TAMU_API_KEY, exactly as the app's working transport did: it is sent
+as an `Authorization: Bearer` header by the SDK's `auth_token=` parameter. The token's
+value is never printed, logged, or included in any error text this script emits.
 """
 
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 from pathlib import Path
 from typing import Any, Callable
 
 import anthropic
-from anthropic import AnthropicBedrock
+from anthropic import Anthropic
+from dotenv import load_dotenv
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+REPO_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(REPO_ROOT))
 
-from spice_mcp_app.config import ConfigError, load_config  # noqa: E402
 from spice_mcp_app.llm import (  # noqa: E402
     PROMPTED_STOP,
     ProtocolError,
@@ -62,9 +66,15 @@ from spice_mcp_app.llm import (  # noqa: E402
     prompted_tool_result_message,
 )
 
-# A deliberately trivial stand-in for a real MCP tool. The answer is not derivable
-# without calling it, so a model that answers without a tool call has ignored `tools`.
-# Note the flat shape - name/description/input_schema, no function wrapper.
+# Deliberately not imported from spice_mcp_app.config: that module still requires AWS
+# credentials, and this probe has to run *before* it is migrated. Keeping the two
+# independent also means a config bug cannot masquerade as a gateway failure.
+DEFAULT_BASE_URL = "https://gateway.api.tamu.ai"
+DEFAULT_MODEL = "us.anthropic.claude-opus-5"
+
+# A trivial stand-in for a real MCP tool. The answer is not derivable without calling it,
+# so a model that answers straight away has ignored `tools`. Note the flat Anthropic shape
+# - name/description/input_schema, with no OpenAI `function` wrapper.
 PROBE_TOOL = {
     "name": "get_component_value",
     "description": (
@@ -84,22 +94,27 @@ PROBE_TOOL = {
 }
 
 PROBE_QUESTION = "What is the value of C1 in the circuit I have open?"
-PROBE_TOOL_RESULT = '{"ref": "C1", "value": "100n"}'
+
+# An odd value on purpose. `100n` - the previous probe's choice - is the most guessable
+# capacitance there is, so an answer built from memory rather than from the tool result
+# would have passed. Nothing in this repository contains this string.
+PROBE_VALUE = "3.917n"
+PROBE_TOOL_RESULT = f'{{"ref": "C1", "value": "{PROBE_VALUE}"}}'
 
 # Enough for an answer plus adaptive thinking, which is on by default and counts here.
 MAX_TOKENS = 2048
 
-# A create() closure bound to one client and model. Both probes take one, so neither can
-# quietly probe a different model than the banner printed.
+# A create() closure bound to one client and model, so neither probe can quietly exercise
+# a different model than the banner printed.
 Create = Callable[..., Any]
 
 
 def show_usage(response: object) -> bool:
     """Print the usage block and report whether it is actually usable.
 
-    Bedrock uses the session log's own names (input_tokens/output_tokens) and has no
-    total_tokens. A null or zero count here would invalidate the cost comparison, so this
-    is a pass/fail check, not a diagnostic print.
+    The Messages API uses the session log's own names (input_tokens/output_tokens). A null
+    or zero count here would invalidate the cost comparison the log exists for, so this is
+    a pass/fail check rather than a diagnostic print.
     """
     usage = getattr(response, "usage", None)
     if usage is None:
@@ -121,23 +136,35 @@ def response_text(response: object) -> str:
     ).strip()
 
 
-def explain_and_exit(exc: Exception, model: str, region: str) -> int:
-    """Turn the SDK's exception into the thing the user actually has to go do."""
-    if isinstance(exc, (anthropic.NotFoundError, anthropic.PermissionDeniedError)):
-        print(f"\nFAIL: Bedrock will not serve {model} in {region}.", file=sys.stderr)
+def explain_and_exit(exc: Exception, model: str, base_url: str) -> int:
+    """Turn the SDK's exception into the thing the user actually has to go do.
+
+    Every branch names the gateway. None of them mentions AWS: the client has no AWS
+    identity to fix, and a Bedrock-flavoured diagnostic here would send the reader off to
+    a console they have no access to.
+    """
+    if isinstance(exc, anthropic.NotFoundError):
+        print(f"\nFAIL: {base_url} did not route {model!r}.", file=sys.stderr)
         print(
-            "  Either the inference profile does not exist in that region or this\n"
-            "  account has not been granted access to the model.\n"
-            "    * list what is available:  python scripts/list_bedrock_models.py\n"
-            "    * enable it:               Bedrock console -> Model access\n"
-            "    * or point elsewhere:      SPICE_MCP_AWS_REGION=<region> in .env",
+            "  Either the gateway does not offer that model id, or the account is not\n"
+            "  entitled to it. Try another id from the gateway's model list, or pass one\n"
+            "  on the command line. A 404 here is about the gateway's routing table, not\n"
+            "  about anything on this machine.",
             file=sys.stderr,
         )
-    elif isinstance(exc, anthropic.AuthenticationError):
-        print("\nFAIL: Bedrock rejected the credentials.", file=sys.stderr)
+    elif isinstance(exc, (anthropic.AuthenticationError, anthropic.PermissionDeniedError)):
+        print(f"\nFAIL: {base_url} rejected the credential.", file=sys.stderr)
         print(
-            "  The chain found something, but it was not accepted. Check the account,\n"
-            "  and that the principal has bedrock:InvokeModel on this model.",
+            "  TAMU_API_KEY was sent as an Authorization: Bearer header. Check that the\n"
+            "  token in .env is current and entitled to this model. (The value is not\n"
+            "  printed here by design.)",
+            file=sys.stderr,
+        )
+    elif isinstance(exc, anthropic.APIConnectionError):
+        print(f"\nFAIL: could not reach {base_url}.", file=sys.stderr)
+        print(
+            "  A network or VPN issue rather than a configuration one - the request\n"
+            "  never got an HTTP status back.",
             file=sys.stderr,
         )
     else:
@@ -146,8 +173,12 @@ def explain_and_exit(exc: Exception, model: str, region: str) -> int:
 
 
 def uses_the_result(text: str) -> bool:
-    """Did the answer actually carry the value only the tool could have supplied?"""
-    return "100n" in text.replace(" ", "") or "100" in text
+    """Did the answer carry the value only the tool could have supplied?
+
+    Matched on the digits, so `3.917n`, `3.917 nF` and `3.917nF` all count, while a
+    plausible-sounding invented value does not.
+    """
+    return "3.917" in text.replace(" ", "")
 
 
 def probe_plain(create: Create) -> tuple[str, bool]:
@@ -155,7 +186,7 @@ def probe_plain(create: Create) -> tuple[str, bool]:
 
     Returns (text, usage_ok). An empty text is the caller's cue to stop.
     """
-    print("[1/3] plain completion")
+    print("[1/3] plain completion over /v1/messages")
     plain = create(messages=[{"role": "user", "content": "Reply with just: ok"}])
     text = response_text(plain)
     print(f"  stop_reason: {plain.stop_reason}")
@@ -163,15 +194,15 @@ def probe_plain(create: Create) -> tuple[str, bool]:
     return text, show_usage(plain)
 
 
-def probe_native(create: Create, model: str, region: str, usage_ok: bool) -> int:
+def probe_native(create: Create, model: str, base_url: str, usage_ok: bool) -> int:
     """Stages 2 and 3 of native tool use: a real tool_use block, then a tool_result."""
     # --- 2. does it emit a real tool_use block? ------------------------------------
-    print("\n[2/3] tool_use emission")
+    print("\n[2/3] tool_use emission (Anthropic-format `tools` sent)")
     messages: list[dict[str, object]] = [{"role": "user", "content": PROBE_QUESTION}]
     try:
         tool_turn = create(messages=messages, tools=[PROBE_TOOL])
     except Exception as exc:
-        return explain_and_exit(exc, model, region)
+        return explain_and_exit(exc, model, base_url)
 
     print(f"  stop_reason: {tool_turn.stop_reason}")
     print(f"  blocks:      {[b.type for b in tool_turn.content]}")
@@ -182,11 +213,13 @@ def probe_native(create: Create, model: str, region: str, usage_ok: bool) -> int
             file=sys.stderr,
         )
         print(
-            "  If that text looks like a tool call written out in prose, the tool\n"
-            "  channel is not open - check that `tools` is being sent and that\n"
-            "  thinking has not been disabled.\n"
-            "  Re-run with --prompted-json to see whether the fallback mode works for\n"
-            "  this model, and set SPICE_MCP_TOOL_MODE=prompted_json if it does.",
+            "  This is the same shape of failure already seen on /v1/chat/completions:\n"
+            "  the route accepts `tools` and then answers as though it had none. If the\n"
+            "  text above reads like a tool call written out in prose, the tool channel\n"
+            "  is not open on this route - and no amount of prompting makes this stage\n"
+            "  pass, which is the point of keeping it strict.\n"
+            "  Re-run with --prompted-json to confirm the fallback still works, and\n"
+            "  leave SPICE_MCP_TOOL_MODE=prompted_json in place.",
             file=sys.stderr,
         )
         return 1
@@ -205,6 +238,8 @@ def probe_native(create: Create, model: str, region: str, usage_ok: bool) -> int
 
     # --- 3. round trip a tool_result ----------------------------------------------
     print("\n[3/3] tool_result round trip")
+    # The assistant turn is replayed verbatim, which is what carries any thinking block
+    # back alongside the tool_use from the same turn.
     messages.append({"role": "assistant", "content": tool_turn.content})
     messages.append(
         {
@@ -221,7 +256,7 @@ def probe_native(create: Create, model: str, region: str, usage_ok: bool) -> int
     try:
         final = create(messages=messages, tools=[PROBE_TOOL])
     except Exception as exc:
-        return explain_and_exit(exc, model, region)
+        return explain_and_exit(exc, model, base_url)
 
     final_text = response_text(final)
     print(f"  stop_reason: {final.stop_reason}")
@@ -232,11 +267,17 @@ def probe_native(create: Create, model: str, region: str, usage_ok: bool) -> int
 
     print()
     if round_trip_ok and usage_ok:
-        print(f"PASS: {model} does native tool use on Bedrock, with usable token counts.")
+        print(
+            f"PASS: {model} does native Anthropic tool use through {base_url},\n"
+            f"      with usable token counts. SPICE_MCP_TOOL_MODE=native is viable."
+        )
         return 0
     if not round_trip_ok:
         print(
-            "FAIL: the tool_result was accepted but the answer did not use it.",
+            f"FAIL: the tool_result was accepted but the answer did not use "
+            f"{PROBE_VALUE}.\n"
+            "      A tool channel that delivers results the model then ignores is not\n"
+            "      usable for diagnosis.",
             file=sys.stderr,
         )
     if not usage_ok:
@@ -248,7 +289,7 @@ def probe_native(create: Create, model: str, region: str, usage_ok: bool) -> int
     return 1
 
 
-def probe_prompted_json(create: Create, model: str, region: str, usage_ok: bool) -> int:
+def probe_prompted_json(create: Create, model: str, base_url: str, usage_ok: bool) -> int:
     """The fallback protocol, exercised through the app's own prompt builder and parser.
 
     Note what is deliberately absent from both requests: a `tools` argument. Sending it
@@ -265,7 +306,7 @@ def probe_prompted_json(create: Create, model: str, region: str, usage_ok: bool)
     try:
         turn = create(messages=messages, system=system, stop_sequences=PROMPTED_STOP)
     except Exception as exc:
-        return explain_and_exit(exc, model, region)
+        return explain_and_exit(exc, model, base_url)
 
     text = response_text(turn)
     print(f"  stop_reason: {turn.stop_reason}")
@@ -303,7 +344,7 @@ def probe_prompted_json(create: Create, model: str, region: str, usage_ok: bool)
     try:
         final = create(messages=messages, system=system, stop_sequences=PROMPTED_STOP)
     except Exception as exc:
-        return explain_and_exit(exc, model, region)
+        return explain_and_exit(exc, model, base_url)
 
     final_text = response_text(final)
     print(f"  stop_reason: {final.stop_reason}")
@@ -324,7 +365,8 @@ def probe_prompted_json(create: Create, model: str, region: str, usage_ok: bool)
         return 1
     if not uses_the_result(answer["text"]):
         print(
-            "FAIL: the tool result was delivered but the answer does not use it.\n"
+            f"FAIL: the tool result was delivered but the answer does not use "
+            f"{PROBE_VALUE}.\n"
             "      Inspect the reply above before trusting the loop.",
             file=sys.stderr,
         )
@@ -337,10 +379,25 @@ def probe_prompted_json(create: Create, model: str, region: str, usage_ok: bool)
         )
         return 1
     print(
-        f"PASS: {model} does prompted-JSON tool calling on Bedrock. Set\n"
-        "      SPICE_MCP_TOOL_MODE=prompted_json to use it for this model."
+        f"PASS: {model} does prompted-JSON tool calling through {base_url}.\n"
+        "      SPICE_MCP_TOOL_MODE=prompted_json is the working mode for this route."
     )
     return 0
+
+
+def _normalize_base_url(raw: str) -> str:
+    """Trim a trailing /v1, /openai or /api off a pasted gateway URL.
+
+    The SDK appends `/v1/messages` itself, so a base URL that already ends in `/v1`
+    produces `/v1/v1/messages` and a 404 that reads like a missing model.
+    """
+    value = (raw or "").strip().rstrip("/")
+    if not value:
+        return DEFAULT_BASE_URL
+    for suffix in ("/v1", "/openai", "/api"):
+        if value.lower().endswith(suffix):
+            value = value[: -len(suffix)]
+    return value or DEFAULT_BASE_URL
 
 
 def main() -> int:
@@ -353,21 +410,32 @@ def main() -> int:
     )
     args = parser.parse_args()
 
-    try:
-        cfg = load_config()
-    except ConfigError as exc:
-        print(exc, file=sys.stderr)
+    load_dotenv(REPO_ROOT / ".env")
+
+    token = (os.environ.get("TAMU_API_KEY") or "").strip()
+    if not token:
+        print(
+            "TAMU_API_KEY is not set, so the gateway cannot be reached.\n\n"
+            f"Put it in {REPO_ROOT / '.env'} (git-ignored) as:\n"
+            "  TAMU_API_KEY=<your gateway token>\n"
+            "It is sent as an Authorization: Bearer header and is never logged.",
+            file=sys.stderr,
+        )
         return 1
 
-    model = args.model or cfg.model
+    base_url = _normalize_base_url(os.environ.get("SPICE_MCP_BASE_URL") or "")
+    model = args.model or (os.environ.get("SPICE_MCP_MODEL") or "").strip() or DEFAULT_MODEL
     mode = "prompted_json" if args.prompted_json else "native"
+    configured = (os.environ.get("SPICE_MCP_TOOL_MODE") or "").strip() or "(unset)"
 
+    print(f"Gateway:       {base_url}/v1/messages")
     print(f"Model:         {model}")
-    print(f"Region:        {cfg.aws_region}")
-    print(f"Credentials:   {cfg.credentials_source}")
-    print(f"Tool mode:     {mode}\n")
+    print("Credential:    TAMU_API_KEY, sent as Authorization: Bearer")
+    print(f"Probing mode:  {mode}   (.env currently says {configured})\n")
 
-    client = AnthropicBedrock(aws_region=cfg.aws_region)
+    # auth_token= produces `Authorization: Bearer <token>` and omits x-api-key, which is
+    # the same scheme the app's previously-working TAMU transport used.
+    client = Anthropic(base_url=base_url, auth_token=token, timeout=180.0)
 
     def create(**kwargs: Any) -> Any:
         # Never pass `thinking`. Disabling it on Opus 5 makes the model occasionally write
@@ -378,14 +446,14 @@ def main() -> int:
     try:
         text, usage_ok = probe_plain(create)
     except Exception as exc:
-        return explain_and_exit(exc, model, cfg.aws_region)
+        return explain_and_exit(exc, model, base_url)
     if not text:
         print("\nFAIL: the model returned no text at all.", file=sys.stderr)
         return 1
 
     if args.prompted_json:
-        return probe_prompted_json(create, model, cfg.aws_region, usage_ok)
-    return probe_native(create, model, cfg.aws_region, usage_ok)
+        return probe_prompted_json(create, model, base_url, usage_ok)
+    return probe_native(create, model, base_url, usage_ok)
 
 
 if __name__ == "__main__":
