@@ -1,0 +1,26 @@
+{
+  "label": "after-hard",
+  "circuit": "wrong_value_lowpass.asc",
+  "model": "us.anthropic.claude-opus-5",
+  "tool_mode": "prompted_json",
+  "count_only": false,
+  "session_log": "C:\\Users\\Expertician\\ClaudeCodeTest\\SpiceMCP\\sessions\\ccf9b3a6-67fd-44bd-b61f-63dbc0306862.json",
+  "rows": [
+    {
+      "question": "I designed this as an RC low-pass with a 1 kHz cutoff, but it rolls off far too early. What is wrong?",
+      "ok": true,
+      "rounds": 1,
+      "tool_calls": [],
+      "tool_call_count": 0,
+      "tool_result_chars": [],
+      "input_tokens": 3567,
+      "output_tokens": 252,
+      "total_tokens": 3819,
+      "answer_words": 42,
+      "answer_chars": 192,
+      "correct": true,
+      "missing": [],
+      "answer": "C1 is 1 \u00b5F, 10x too large. With R1 = 1.6 k: fc = 1/(2\u03c0\u00b71600\u00b71e-6) \u2248 99.5 Hz, which is why it rolls off a decade early. Change C1 to 100n: 1/(2\u03c0\u00b71600\u00b7100e-9) \u2248 995 Hz \u2248 1 kHz. R1 is fine as-is."
+    }
+  ]
+}
