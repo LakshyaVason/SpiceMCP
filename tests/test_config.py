@@ -271,6 +271,59 @@ def test_the_tool_mode_appears_in_the_config_the_ui_is_shown(env):
     assert load_config().redacted()["tool_mode"] == "prompted_json"
 
 
+# --- the effort knob ------------------------------------------------------------------
+#
+# `output_config={"effort": ...}` is the only lever on thinking tokens that exists here, and
+# `usage.output_tokens` includes them - about 770 of the baseline turn's ~1350. It is
+# optional and probed rather than assumed, so the default path has to stay untouched.
+
+
+def test_effort_is_unset_by_default(env):
+    """Unset means the parameter is omitted, so behaviour is identical to before it existed.
+
+    `high` is already the model's own default; sending it explicitly would make an unset
+    configuration indistinguishable from a deliberate one.
+    """
+    assert load_config().effort is None
+
+
+def test_effort_is_read_from_the_environment(env):
+    env.setenv("SPICE_MCP_EFFORT", " LOW ")
+    assert load_config().effort == "low"
+
+
+def test_a_misspelled_effort_is_rejected_rather_than_ignored(env):
+    """Same argument as the tool mode: someone who set `lo` to cut the cost of a demo would
+    otherwise be charged the full price with no explanation."""
+    env.setenv("SPICE_MCP_EFFORT", "lo")
+    with pytest.raises(ConfigError, match="SPICE_MCP_EFFORT"):
+        load_config()
+
+
+def test_temperature_is_not_a_setting_anywhere(env):
+    """It was the obvious first guess and it is wrong twice over.
+
+    `temperature` is not a parameter of `messages.create` in anthropic 1.3.0, and forcing it
+    through `extra_body` is a 400 on Opus 5. It also controls sampling variability rather
+    than length. This test exists so a future reader does not spend the afternoon rediscovering
+    that.
+    """
+    import spice_mcp_app.config as config_module
+    import spice_mcp_app.llm as llm_module
+
+    for module in (config_module, llm_module):
+        source = Path(module.__file__).read_text(encoding="utf-8")
+        for banned in ("temperature=", "top_p", "top_k"):
+            assert banned not in source, f"{banned} appeared in {module.__name__}"
+
+
+def test_the_effort_appears_in_the_config_the_ui_is_shown(env):
+    env.setenv("SPICE_MCP_EFFORT", "medium")
+    assert load_config().redacted()["effort"] == "medium"
+    env.delenv("SPICE_MCP_EFFORT")
+    assert load_config().redacted()["effort"] == "default (unset)"
+
+
 # --- what the server subprocess inherits ----------------------------------------------
 
 

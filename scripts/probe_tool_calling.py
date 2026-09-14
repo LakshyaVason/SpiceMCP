@@ -19,6 +19,7 @@ blocks? Until this passes, `SPICE_MCP_TOOL_MODE` stays where it is.
     python scripts/probe_tool_calling.py                          # model from .env
     python scripts/probe_tool_calling.py us.anthropic.claude-opus-5
     python scripts/probe_tool_calling.py --prompted-json          # the fallback mode
+    python scripts/probe_tool_calling.py --effort low             # + the effort parameter
 
 Native mode (the default) runs three stages, each a distinct way the route can fail:
 
@@ -30,6 +31,14 @@ Native mode (the default) runs three stages, each a distinct way the route can f
 
 `--prompted-json` probes the other mode using the app's own prompt builder, stop sequence
 and parser - not copies - so a pass is evidence about the shipping code path.
+
+`--effort LEVEL` adds a pre-flight stage for `output_config={"effort": LEVEL}`, the only
+parameter that reaches the *thinking* half of the output cost - `usage.output_tokens`
+includes thinking tokens, so prompt wording alone cannot touch it. The gateway is a routing
+layer and need not forward every Messages parameter, so this asks whether it does, and then
+measures the same prompt with and without it. When accepted, the level is applied to the
+remaining stages too, so a mode is never certified under settings the app would not use.
+**Never `temperature`** (absent from the SDK, and a 400 on Opus 5) and never `thinking`.
 
 **The native probe's meaning is fixed.** Stage 2 passes only on a genuine `tool_use`
 block. Prose that merely looks like a tool call is a FAIL, and the bar is not lowered so
@@ -58,6 +67,7 @@ from dotenv import load_dotenv
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
+from spice_mcp_app.config import EFFORT_LEVELS  # noqa: E402
 from spice_mcp_app.llm import (  # noqa: E402
     PROMPTED_STOP,
     ProtocolError,
@@ -66,9 +76,11 @@ from spice_mcp_app.llm import (  # noqa: E402
     prompted_tool_result_message,
 )
 
-# Deliberately not imported from spice_mcp_app.config: that module still requires AWS
-# credentials, and this probe has to run *before* it is migrated. Keeping the two
-# independent also means a config bug cannot masquerade as a gateway failure.
+# The URL and model default are deliberately *not* read through `load_config()`, so that a
+# configuration bug cannot masquerade as a gateway failure - this script has to be able to
+# say "the route is fine, your .env is not". `EFFORT_LEVELS` above is imported rather than
+# re-typed because it is a list of literals with no behaviour, and a second copy would
+# drift.
 DEFAULT_BASE_URL = "https://gateway.api.tamu.ai"
 DEFAULT_MODEL = "us.anthropic.claude-opus-5"
 
@@ -179,6 +191,61 @@ def uses_the_result(text: str) -> bool:
     plausible-sounding invented value does not.
     """
     return "3.917" in text.replace(" ", "")
+
+
+# Something with a little arithmetic in it, so there is thinking for `effort` to act on. A
+# prompt with nothing to work out would show no difference between levels and prove nothing.
+EFFORT_QUESTION = (
+    "A 10k and a 15k resistor form a divider across a 5 V source. What is the voltage at "
+    "the midpoint? Give the number and nothing else."
+)
+
+
+def probe_effort(create: Create, level: str, model: str, base_url: str) -> bool:
+    """Does the gateway forward `output_config`, and does it change anything?
+
+    Returns whether the parameter is usable. A rejection is **not** a failed probe: unset is
+    the app's default and a gateway that refuses the parameter is a fact to record, not a
+    broken route. The app's own fallback is the same - warn once, continue without it.
+
+    The second, unparameterised request is what makes the answer worth having. A gateway can
+    accept an unknown field and drop it on the floor, in which case the request "succeeds"
+    and the setting does nothing; only the token counts distinguish that from a real effect.
+    """
+    print(f"[effort] output_config={{'effort': '{level}'}} pre-flight")
+    try:
+        with_effort = create(
+            messages=[{"role": "user", "content": EFFORT_QUESTION}],
+            output_config={"effort": level},
+        )
+    except anthropic.BadRequestError as exc:
+        text = str(exc).lower()
+        if "output_config" in text or "effort" in text:
+            print(f"  REJECTED: {exc}")
+            print(
+                "  -> the gateway does not forward output_config. Leave SPICE_MCP_EFFORT\n"
+                "     unset; the app logs one warning and continues without it, so this\n"
+                "     costs nothing but the parameter is not available on this route."
+            )
+            return False
+        # A 400 about something else is a real failure and must not be reported as
+        # "effort unsupported" - that would send the reader after the wrong thing.
+        raise
+
+    without = create(messages=[{"role": "user", "content": EFFORT_QUESTION}])
+    hi = getattr(without.usage, "output_tokens", 0) or 0
+    lo = getattr(with_effort.usage, "output_tokens", 0) or 0
+    print(f"  accepted.    output tokens: {lo} with effort={level}, {hi} unset")
+    print(f"  answer:      {response_text(with_effort)[:80]!r}")
+    if hi and lo:
+        print(f"  -> {(hi - lo) / hi:+.0%} on this one prompt (a single sample, not a mean)")
+    if lo >= hi:
+        print(
+            "  -> accepted but no saving here. One prompt is not evidence of no effect;\n"
+            "     it is evidence not to assume one. Measure a real turn before relying on it."
+        )
+    print()
+    return True
 
 
 def probe_plain(create: Create) -> tuple[str, bool]:
@@ -408,6 +475,12 @@ def main() -> int:
         action="store_true",
         help="probe the prompted-JSON tool mode instead of native `tools` support",
     )
+    parser.add_argument(
+        "--effort",
+        choices=EFFORT_LEVELS,
+        help="also probe output_config={'effort': ...}, and apply it to the other stages "
+             "if the gateway forwards it",
+    )
     args = parser.parse_args()
 
     load_dotenv(REPO_ROOT / ".env")
@@ -431,17 +504,31 @@ def main() -> int:
     print(f"Gateway:       {base_url}/v1/messages")
     print(f"Model:         {model}")
     print("Credential:    TAMU_API_KEY, sent as Authorization: Bearer")
-    print(f"Probing mode:  {mode}   (.env currently says {configured})\n")
+    print(f"Probing mode:  {mode}   (.env currently says {configured})")
+    print(f"Effort:        {args.effort or 'not probed (the app default is unset)'}\n")
 
     # auth_token= produces `Authorization: Bearer <token>` and omits x-api-key, which is
     # the same scheme the app's previously-working TAMU transport used.
     client = Anthropic(base_url=base_url, auth_token=token, timeout=180.0)
 
+    # Set only once the pre-flight has shown the gateway forwards it, so a rejection cannot
+    # take the tool-calling stages down with it.
+    effort: str | None = None
+
     def create(**kwargs: Any) -> Any:
         # Never pass `thinking`. Disabling it on Opus 5 makes the model occasionally write
         # a tool call into its visible text instead of a tool_use block - which is the
         # failure this script exists to detect, so we must not induce it ourselves.
+        if effort and "output_config" not in kwargs:
+            kwargs["output_config"] = {"effort": effort}
         return client.messages.create(model=model, max_tokens=MAX_TOKENS, **kwargs)
+
+    if args.effort:
+        try:
+            if probe_effort(create, args.effort, model, base_url):
+                effort = args.effort
+        except Exception as exc:
+            return explain_and_exit(exc, model, base_url)
 
     try:
         text, usage_ok = probe_plain(create)

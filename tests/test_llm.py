@@ -1192,6 +1192,143 @@ def test_llm_error_is_the_type_the_ui_catches():
     assert issubclass(LLMError, RuntimeError)
 
 
+# --- the effort knob ------------------------------------------------------------------
+#
+# The only lever on thinking tokens that exists on this model, and thinking is most of the
+# output cost - roughly 770 of the baseline turn's ~1350. `temperature` is not an
+# alternative: it is absent from `messages.create` in anthropic 1.3.0 and 400s through
+# `extra_body` on Opus 5.
+#
+# Since the gateway is a routing layer that need not forward every Messages parameter, the
+# tests below are as much about the failure mode as the feature.
+
+
+def _recording_client(fake_config, *, effort=None, reject_with=None):
+    """A GatewayClient that records request kwargs instead of sending them.
+
+    Offline for the same reason as `_gateway_client_raising`: `object.__new__` skips the
+    constructor, which would want a token.
+
+    `reject_with` raises that exception on the *first* call only, so a test can tell a
+    retry from a re-raise by what the recorder ends up holding.
+    """
+    client = object.__new__(GatewayClient)
+    client._config = replace(fake_config, effort=effort)
+    calls: list[dict] = []
+
+    class Recorder:
+        class messages:
+            @staticmethod
+            def create(**kwargs):
+                calls.append(kwargs)
+                if reject_with is not None and len(calls) == 1:
+                    raise reject_with
+                return answer("ok")
+
+            @staticmethod
+            def count_tokens(**kwargs):
+                calls.append(kwargs)
+                if reject_with is not None and len(calls) == 1:
+                    raise reject_with
+                return Usage(input_tokens=42)
+
+    client._client = Recorder()
+    return client, calls
+
+
+def _bad_request(message):
+    return anthropic.BadRequestError(message, response=_response(400), body=None)
+
+
+def test_an_unset_effort_omits_the_parameter_entirely(fake_config):
+    """The default path has to be byte-identical to what it was before this setting existed.
+
+    Sending `high` explicitly would be equivalent for the model and wrong for us: it would
+    make "nobody configured this" indistinguishable from "somebody chose high".
+    """
+    client, calls = _recording_client(fake_config, effort=None)
+    client.complete([{"role": "user", "content": "hi"}])
+
+    assert calls[0]["output_config"] is anthropic.NOT_GIVEN
+
+
+def test_a_set_effort_travels_on_the_request(fake_config):
+    client, calls = _recording_client(fake_config, effort="low")
+    client.complete([{"role": "user", "content": "hi"}])
+
+    assert calls[0]["output_config"] == {"effort": "low"}
+    # Never these, on any code path. `thinking` in particular: passing it at all has been
+    # seen to make the model narrate a tool call in visible text instead of emitting a
+    # `tool_use` block, and `budget_tokens` is a 400 on Opus 5.
+    assert "thinking" not in calls[0]
+    assert "temperature" not in calls[0]
+
+
+def test_the_count_tokens_probe_carries_the_same_effort(fake_config):
+    """Otherwise `measure_turn.py --count-only` would price a request nobody sends."""
+    client, calls = _recording_client(fake_config, effort="medium")
+
+    assert client.count_tokens([{"role": "user", "content": "hi"}]) == 42
+    assert calls[0]["output_config"] == {"effort": "medium"}
+
+
+def test_a_gateway_that_rejects_output_config_retries_once_without_it(fake_config):
+    """A gateway that does not forward the parameter must not break the turn it appears on.
+
+    The recovery is checked through what the *second* request carried, not through the
+    return value: a retry that resent the rejected parameter would loop or fail identically.
+    """
+    client, calls = _recording_client(
+        fake_config,
+        effort="low",
+        reject_with=_bad_request("output_config: unsupported parameter"),
+    )
+
+    client.complete([{"role": "user", "content": "hi"}])
+
+    assert len(calls) == 2, "expected exactly one retry"
+    assert calls[0]["output_config"] == {"effort": "low"}
+    assert calls[1]["output_config"] is anthropic.NOT_GIVEN
+    # Off for the rest of the process, so the cost is one 400 per run and not one per turn.
+    assert client._output_config() is anthropic.NOT_GIVEN
+    # An instance attribute, so one client's discovery cannot silently disable the parameter
+    # for every future client in the process - including a differently-configured one.
+    assert GatewayClient._effort_supported is True
+
+
+def test_a_400_about_something_else_is_not_retried_and_not_swallowed(fake_config):
+    """The narrowness is the point.
+
+    "Retry any 400 once" would hide a real request error behind a second identical failure,
+    and the message the user needs would be the one thrown away.
+    """
+    client, calls = _recording_client(
+        fake_config, effort="low", reject_with=_bad_request("max_tokens is required")
+    )
+
+    with pytest.raises(LLMError) as caught:
+        client.complete([{"role": "user", "content": "hi"}])
+
+    assert "max_tokens" in str(caught.value)
+    assert len(calls) == 1, "a 400 unrelated to the parameter must not be retried"
+
+
+def test_no_retry_when_the_parameter_was_never_being_sent(fake_config):
+    """With effort unset there is nothing to disable, so a 400 mentioning it is a real error.
+
+    Without this guard the retry would be reachable on the default path, where it can only
+    ever duplicate a failed request.
+    """
+    client, calls = _recording_client(
+        fake_config, effort=None, reject_with=_bad_request("effort is weird")
+    )
+
+    with pytest.raises(LLMError):
+        client.complete([{"role": "user", "content": "hi"}])
+
+    assert len(calls) == 1
+
+
 # --- the approval gate ----------------------------------------------------------------
 
 

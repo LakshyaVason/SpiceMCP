@@ -70,6 +70,26 @@ TOOL_MODES = (TOOL_MODE_NATIVE, TOOL_MODE_PROMPTED_JSON)
 # what this gateway's `/v1/chat/completions` path does with the very same model.
 DEFAULT_TOOL_MODE = TOOL_MODE_NATIVE
 
+# How much thinking the model does before answering: `output_config={"effort": ...}` on the
+# Messages API. Relevant here because `usage.output_tokens` **includes adaptive thinking
+# tokens** - on the baseline turn roughly 770 of ~1350 - so prompt wording alone can only
+# reach about 40% of the output cost. This is the parameter that reaches the rest.
+#
+# It is not a substitute for the prompt: lower effort buys terser reasoning, not a
+# fault-first answer, and a circuit that needs the arithmetic still needs the thinking.
+#
+# `temperature` is deliberately absent, and not as an oversight. It is not a parameter of
+# `messages.create` in anthropic 1.3.0 at all, and forcing it through `extra_body` is
+# rejected with a 400 by Opus 5. It also controls sampling variability rather than length,
+# so it was never the right lever for verbosity even where it exists.
+EFFORT_LEVELS = ("low", "medium", "high", "xhigh", "max")
+
+# Unset by default, which means the parameter is **omitted entirely** and the request is
+# byte-identical to what it was before this setting existed. The gateway's support for
+# `output_config` is probed rather than assumed (`scripts/probe_tool_calling.py --effort`),
+# and a gateway that rejects it must not break the default path.
+DEFAULT_EFFORT: str | None = None
+
 
 class ConfigError(RuntimeError):
     """Raised when required configuration is missing."""
@@ -82,6 +102,7 @@ class Config:
     credentials_source: str
     sessions_dir: Path
     tool_mode: str = DEFAULT_TOOL_MODE
+    effort: str | None = DEFAULT_EFFORT
 
     @property
     def messages_url(self) -> str:
@@ -104,6 +125,10 @@ class Config:
             "credentials": self.credentials_source,
             "sessions_dir": str(self.sessions_dir),
             "tool_mode": self.tool_mode,
+            # A level name or "default (unset)" - never a secret, and worth surfacing: an
+            # effort setting changes what every answer costs, so it belongs where the model
+            # and the gateway are already shown.
+            "effort": self.effort or "default (unset)",
         }
 
 
@@ -164,6 +189,7 @@ def load_config(*, require_credentials: bool = True) -> Config:
             (os.environ.get("SPICE_MCP_SESSIONS_DIR") or "").strip()
         ),
         tool_mode=_resolve_tool_mode(os.environ.get("SPICE_MCP_TOOL_MODE")),
+        effort=_resolve_effort(os.environ.get("SPICE_MCP_EFFORT")),
     )
 
 
@@ -182,6 +208,25 @@ def _resolve_tool_mode(raw: str | None) -> str:
         raise ConfigError(
             f"SPICE_MCP_TOOL_MODE={raw!r} is not a known mode. "
             f"Use one of: {', '.join(TOOL_MODES)}."
+        )
+    return value
+
+
+def _resolve_effort(raw: str | None) -> str | None:
+    """Validate SPICE_MCP_EFFORT, rejecting typos rather than defaulting past them.
+
+    Mirrors `_resolve_tool_mode`, and for the same reason. Empty means unset, which means
+    the parameter is omitted and the model uses its own default (`high` on Opus 5). A typo
+    must not silently become that: someone who set `SPICE_MCP_EFFORT=lo` to cut the cost of
+    a demo would otherwise be shown the full price and no explanation.
+    """
+    value = (raw or "").strip().lower()
+    if not value:
+        return DEFAULT_EFFORT
+    if value not in EFFORT_LEVELS:
+        raise ConfigError(
+            f"SPICE_MCP_EFFORT={raw!r} is not a known effort level. "
+            f"Use one of: {', '.join(EFFORT_LEVELS)}, or leave it unset."
         )
     return value
 

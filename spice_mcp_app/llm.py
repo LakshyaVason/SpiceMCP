@@ -477,6 +477,15 @@ class GatewayClient:
     carrying it.
     """
 
+    # Class attributes, not instance ones, so an object built with `object.__new__` - which
+    # the error-translation tests do, to avoid needing a token - still reads sane values.
+    #
+    # `_effort_supported` turns itself off the first time the gateway rejects `output_config`
+    # with a 400. The gateway is a routing layer in front of a provider and does not
+    # necessarily forward every Messages parameter; a setting nobody set must not be able to
+    # break a request, and one someone did set must not fail the turn it appears on.
+    _effort_supported = True
+
     def __init__(self, config: Config, *, timeout: float = 180.0) -> None:
         self._config = config
         token = (os.environ.get(TOKEN_ENV_VAR) or "").strip()
@@ -505,7 +514,8 @@ class GatewayClient:
         stop_sequences: list[str] | None = None,
     ) -> Any:
         """One turn. Returns the SDK's Message object."""
-        try:
+
+        def send() -> Any:
             return self._client.messages.create(
                 model=self._config.model,
                 max_tokens=max_tokens,
@@ -513,9 +523,50 @@ class GatewayClient:
                 messages=messages,
                 tools=tools or anthropic.NOT_GIVEN,
                 stop_sequences=stop_sequences or anthropic.NOT_GIVEN,
+                output_config=self._output_config(),
             )
+
+        try:
+            return send()
+        except anthropic.BadRequestError as exc:
+            # Must sit above the APIError branch - BadRequestError is a subclass of it.
+            if self._disable_effort_if_rejected(exc):
+                return send()  # once, and only after the parameter is off
+            raise self._as_llm_error(exc) from exc
         except anthropic.APIError as exc:
             raise self._as_llm_error(exc) from exc
+
+    def _output_config(self) -> Any:
+        """`{"effort": ...}` when it is set and known to work, otherwise NOT_GIVEN.
+
+        Omitted rather than sent with a default value: `high` is already the model's own
+        default, and sending it explicitly would make an unset configuration
+        indistinguishable from a deliberate one in the gateway's logs and in ours.
+        """
+        if not self._config.effort or not self._effort_supported:
+            return anthropic.NOT_GIVEN
+        return {"effort": self._config.effort}
+
+    def _disable_effort_if_rejected(self, exc: anthropic.BadRequestError) -> bool:
+        """Turn `output_config` off for the rest of the process if the gateway refused it.
+
+        Narrow on purpose: only a 400 that names the parameter counts, and only while it was
+        actually being sent. A blanket "retry any 400 once" would hide real request errors
+        behind a second identical failure, and the message the user needs would be the one
+        thrown away.
+        """
+        if not self._config.effort or not self._effort_supported:
+            return False
+        text = str(exc).lower()
+        if "output_config" not in text and "effort" not in text:
+            return False
+        log.warning(
+            "the gateway rejected output_config={'effort': %r}; continuing without it. "
+            "Unset SPICE_MCP_EFFORT to silence this.",
+            self._config.effort,
+        )
+        self._effort_supported = False
+        return True
 
     def count_tokens(
         self,
@@ -535,13 +586,22 @@ class GatewayClient:
         every real turn would double the request count to learn a number `usage` already
         reports for free.
         """
-        try:
-            counted = self._client.messages.count_tokens(
+        def send() -> Any:
+            return self._client.messages.count_tokens(
                 model=self._config.model,
                 system=system,
                 messages=messages,
                 tools=tools or anthropic.NOT_GIVEN,
+                output_config=self._output_config(),
             )
+
+        try:
+            counted = send()
+        except anthropic.BadRequestError as exc:
+            if self._disable_effort_if_rejected(exc):
+                counted = send()
+            else:
+                raise self._as_llm_error(exc) from exc
         except anthropic.APIError as exc:
             raise self._as_llm_error(exc) from exc
         return int(getattr(counted, "input_tokens", 0) or 0)
