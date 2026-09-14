@@ -98,7 +98,15 @@ window.addEventListener("pywebviewready", async () => {
   /* The tool mode is surfaced only when it is not the default, because the fallback is
      the case where a wrong setting looks like a working app that never calls a tool. */
   const mode = started.tool_mode === "prompted_json" ? " · prompted JSON tools" : "";
-  $("model").textContent = `${started.model} · ${started.tools.length} tools${mode}`;
+  /* Two counts when they differ: the server exposes all of them, but a diagnosis turn is
+     only sent the ones it can reach, and every schema is paid for on every round. Saying
+     "7 tools" alone would be true of the server and false of the request. */
+  const offered = (started.tools_offered || []).length;
+  const count =
+    offered && offered !== started.tools.length
+      ? `${started.tools.length} tools (${offered} offered)`
+      : `${started.tools.length} tools`;
+  $("model").textContent = `${started.model} · ${count}${mode}`;
   $("session-path").textContent = started.session_path;
 
   const initial = await window.pywebview.api.get_initial_folder();

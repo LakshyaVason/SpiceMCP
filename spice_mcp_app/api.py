@@ -44,6 +44,23 @@ PATCH_TOOL = "patch_component_value"
 # the session log either way.
 MAX_PRELOADED_FINDINGS = 12
 
+# Tools withheld from the *model's* catalogue during ordinary diagnosis. The seven schemas
+# cost 6588 chars of description and JSON schema on every round - in prompted mode all of it
+# sits in the system prompt - and these two are 1342 of it. Neither is reachable from a
+# diagnosis or from the Apply flow: `diff_netlist` compares two files the user would have to
+# name, and `export_netlist` writes a `.net` nothing here asks for.
+#
+# `patch_component_value` is deliberately **not** in this list even though it is the largest
+# single schema. Without a model call there is no `pending_patch`, so no diff panel and no
+# Apply button, and the whole approval flow dies. Saving tokens by removing the feature is
+# not saving tokens.
+WITHHELD_FROM_DIAGNOSIS = ("diff_netlist", "export_netlist")
+
+# Words that put them back for one turn. The rule can only ever *widen* the catalogue, which
+# is the only shape that is safe: a rule that withholds on a guess can block a legitimate
+# workflow, while a rule that offers too much only costs the tokens it was meant to save.
+WIDEN_KEYWORDS = ("diff", "compar", "export", "before and after", ".net")
+
 
 def _ok(**payload: Any) -> dict[str, Any]:
     return {"ok": True, **payload}
@@ -147,6 +164,10 @@ class Api:
             model=self._config.model,
             tool_mode=self._config.tool_mode,
             tools=[t["name"] for t in self._tools],
+            # What a diagnosis turn actually offers the model. Reported separately so the
+            # header can say "7 tools (5 offered)" rather than a number that is true of the
+            # server and false of the request - the difference is exactly what this saves.
+            tools_offered=[t["name"] for t in self._model_tools("")],
             session_id=self._session.session_id,
             session_path=str(self._session.path),
             config=self._config.redacted(),
@@ -373,6 +394,24 @@ class Api:
 
         return self._mcp.call_tool(name, arguments)
 
+    def _model_tools(self, text: str) -> list[dict[str, Any]]:
+        """The catalogue for this turn: all seven, minus the two nothing here reaches.
+
+        `self._tools` stays the full set - `start()` reports it, and the server's seven are
+        pinned by `tests/test_write_conflict.py`. This is only about what each *request*
+        pays for.
+
+        The keyword trigger widens and never narrows. If the user asks about a diff, a
+        comparison or an export, they get the whole catalogue for that turn; asking about
+        anything else cannot take a tool away that the withheld list did not already name.
+        """
+        if not self._tools:
+            return self._tools
+        lowered = (text or "").lower()
+        if any(word in lowered for word in WIDEN_KEYWORDS):
+            return list(self._tools)
+        return [t for t in self._tools if t["name"] not in WITHHELD_FROM_DIAGNOSIS]
+
     def send_message(self, text: str) -> dict[str, Any]:
         """Run one user turn to completion and return the assistant's answer."""
         if self._session is None or self._client is None:
@@ -388,7 +427,7 @@ class Api:
                 self._client,
                 self._session,
                 text.strip(),
-                tools=self._tools,
+                tools=self._model_tools(text),
                 tool_executor=self._tool_executor,
                 history=self._history,
                 on_progress=progress.append,

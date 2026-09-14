@@ -136,12 +136,16 @@ def count_only(api: Api, question: str, tool_mode: str) -> dict[str, Any]:
     history = copy.deepcopy(api._history)
     append_user_note(history, question)
 
+    # The catalogue the *request* carries, not the seven the server exposes: `_model_tools`
+    # withholds the two a diagnosis cannot reach, and pricing the full set would credit the
+    # trim with nothing.
+    catalogue = api._model_tools(question)
     if tool_mode == TOOL_MODE_PROMPTED_JSON:
-        system = prompted_system_prompt(api._tools)
+        system = prompted_system_prompt(catalogue)
         tools = None
     else:
         system = SYSTEM_PROMPT
-        tools = api._tools
+        tools = catalogue
 
     return {
         "question": question,
@@ -152,8 +156,8 @@ def count_only(api: Api, question: str, tool_mode: str) -> dict[str, Any]:
             history, tools=tools, system=system
         ),
         "system_chars": len(system),
-        "tool_catalogue_names": [t["name"] for t in (tools or api._tools)],
-        "tools_sent": len(tools or []),
+        "tool_catalogue_names": [t["name"] for t in catalogue],
+        "tools_sent": len(catalogue),
     }
 
 

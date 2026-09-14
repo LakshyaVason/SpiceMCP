@@ -35,7 +35,7 @@ import anthropic
 import httpx2
 import pytest
 
-from spice_mcp_app.api import Api
+from spice_mcp_app.api import PATCH_TOOL, Api
 from spice_mcp_app.compact import compact_tool_result
 from spice_mcp_app.config import TOOL_MODE_NATIVE, TOOL_MODE_PROMPTED_JSON
 from spice_mcp_app.llm import (
@@ -1307,6 +1307,80 @@ def test_no_tool_mode_can_write_without_approval(api, tmp_path, mode):
     assert api._mcp.calls == [], "the write reached the MCP server despite the gate"
     assert "REFUSED" in out["tool_calls"][0]["result"]
     assert out["text"] == "Understood, I will show you the diff."
+
+
+# --- the model-facing catalogue ---------------------------------------------------------
+#
+# Seven tool schemas cost 6588 chars on every round. Two of them - `diff_netlist` and
+# `export_netlist`, 1342 chars - are not reachable from a diagnosis or from the Apply flow,
+# so they are withheld from the request while `self._tools` stays the full seven.
+
+SEVEN_TOOLS = mcp_tools_to_anthropic(
+    [
+        FakeTool(name, f"Does {name}.", {"type": "object", "properties": {}})
+        for name in (
+            "read_netlist",
+            "check_netlist_static",
+            "run_simulation",
+            "read_sim_log",
+            "patch_component_value",
+            "diff_netlist",
+            "export_netlist",
+        )
+    ]
+)
+
+
+def test_the_diagnosis_catalogue_drops_the_two_unreachable_tools(api):
+    api._tools = SEVEN_TOOLS
+
+    names = [t["name"] for t in api._model_tools("why is my circuit not getting any gain")]
+
+    assert names == [
+        "read_netlist",
+        "check_netlist_static",
+        "run_simulation",
+        "read_sim_log",
+        "patch_component_value",
+    ]
+    # The full set is untouched: `start()` reports it and `app_smoke.py` stage 1 counts it.
+    assert len(api._tools) == 7
+
+
+def test_patch_component_value_is_never_withheld(api):
+    """It is the largest single schema and the most tempting to cut.
+
+    Without a model call there is no `pending_patch`, so no diff panel, no Apply button and
+    no approval flow. Any turn text at all must still carry it.
+    """
+    api._tools = SEVEN_TOOLS
+    for text in ("why no gain", "export the netlist", "", "fix C1"):
+        assert PATCH_TOOL in [t["name"] for t in api._model_tools(text)]
+
+
+def test_asking_about_a_diff_or_an_export_widens_the_catalogue(api):
+    """The trigger can only widen. A rule that withholds on a guess would block a
+    legitimate workflow; one that offers too much merely costs the tokens it was saving."""
+    api._tools = SEVEN_TOOLS
+    for text in (
+        "diff the two netlists for me",
+        "compare it against the backup",
+        "export this to a .net file",
+        "show me before and after",
+    ):
+        assert len(api._model_tools(text)) == 7, text
+
+
+def test_the_request_carries_the_trimmed_catalogue(api, tmp_path):
+    api._tools = SEVEN_TOOLS
+    api._client = FakeClient([answer("No gain because R1's pin is on NC_01.")])
+
+    out = api.send_message("why is my circuit not getting any gain")
+
+    assert out["ok"], out.get("error")
+    sent = [t["name"] for t in api._client.calls[0]["tools"]]
+    assert "diff_netlist" not in sent and "export_netlist" not in sent
+    assert PATCH_TOOL in sent
 
 
 # --- compact for the model, complete for the record -------------------------------------
