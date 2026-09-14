@@ -113,6 +113,25 @@ index 0 — no scanning prose for something brace-shaped), `type` must be `tool_
 correction message rather than an execution. Arbitrary prose and `antml`-style markup are
 never interpreted as tool calls.
 
+### How hard the model thinks
+
+`SPICE_MCP_EFFORT` — one of `low`, `medium`, `high`, `xhigh`, `max` — is sent as
+`output_config={"effort": …}`. **Unset by default**, which omits the parameter and leaves the
+model on its own default.
+
+It is the only setting that reaches most of what a turn costs to produce: `usage.output_tokens`
+counts the model's *thinking* as well as its answer, and on a typical one-fault diagnosis
+thinking is over half of it. Wording the prompt better shortens the answer and nothing else.
+
+Lower effort buys terser reasoning, not a better diagnosis — a fault whose explanation needs
+arithmetic still needs the thinking to do it. Check the gateway forwards the parameter with
+`probe_tool_calling.py --effort low`; if it does not, the app warns once and carries on
+without it rather than failing the turn.
+
+There is no temperature setting, and that is not an omission: `temperature` is not a
+parameter of the installed SDK's `messages.create`, Opus 5 rejects it outright, and it
+controls sampling variability rather than answer length.
+
 ## Running the app
 
 ```bat
@@ -275,7 +294,7 @@ GUI — which is the whole point of patching the `.asc` rather than a netlist.
 python -m pytest
 ```
 
-288 tests, ~42s. Parser and static-check tests run without LTspice installed; schematic
+337 tests, ~43s. Parser and static-check tests run without LTspice installed; schematic
 tests skip automatically if the executable is not found. Nothing in the suite calls the
 network, so running it costs nothing — the live-model checks are the two scripts,
 `probe_tool_calling.py` and `app_smoke.py` (a headless nine-stage end-to-end run against

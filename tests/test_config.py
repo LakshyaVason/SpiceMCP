@@ -352,6 +352,7 @@ def test_the_server_is_never_given_the_gateway_token(monkeypatch):
     monkeypatch.setenv("SPICE_MCP_BASE_URL", "https://gateway.example.edu")
     monkeypatch.setenv("SPICE_MCP_MODEL", "some-model")
     monkeypatch.setenv("SPICE_MCP_TOOL_MODE", "prompted_json")
+    monkeypatch.setenv("SPICE_MCP_EFFORT", "low")
 
     env = _server_params().env
 
@@ -359,8 +360,10 @@ def test_the_server_is_never_given_the_gateway_token(monkeypatch):
     assert "should-not-travel-to-the-server" not in "".join(env.values())
     assert "SPICE_MCP_BASE_URL" not in env
     assert "SPICE_MCP_MODEL" not in env
-    # How the *model* is asked to call tools is not the server's business either.
+    # How the *model* is asked to call tools, and how hard it thinks, are not the server's
+    # business either.
     assert "SPICE_MCP_TOOL_MODE" not in env
+    assert "SPICE_MCP_EFFORT" not in env
 
 
 def test_the_server_is_not_given_stray_aws_credentials(monkeypatch):
