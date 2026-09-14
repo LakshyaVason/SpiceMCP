@@ -21,6 +21,7 @@ from typing import Any
 
 from spice_mcp_server.ltspice import ltspice_is_running
 
+from .compact import compact_tool_result
 from .config import Config, ConfigError, load_config
 from .llm import (
     AgentResult,
@@ -340,6 +341,10 @@ class Api:
                 history=self._history,
                 on_progress=progress.append,
                 tool_mode=self._config.tool_mode,
+                # Compact for the model, complete for the record: the projection is what
+                # goes into the request, `record.result` below is still the full text the
+                # session log, the UI preview and `_pending_patch` read.
+                compactor=compact_tool_result,
             )
         except LLMError as exc:
             return _err(str(exc))

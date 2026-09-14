@@ -36,6 +36,7 @@ import httpx2
 import pytest
 
 from spice_mcp_app.api import Api
+from spice_mcp_app.compact import compact_tool_result
 from spice_mcp_app.config import TOOL_MODE_NATIVE, TOOL_MODE_PROMPTED_JSON
 from spice_mcp_app.llm import (
     MAX_PROTOCOL_CORRECTIONS,
@@ -1243,6 +1244,170 @@ def test_no_tool_mode_can_write_without_approval(api, tmp_path, mode):
     assert api._mcp.calls == [], "the write reached the MCP server despite the gate"
     assert "REFUSED" in out["tool_calls"][0]["result"]
     assert out["text"] == "Understood, I will show you the diff."
+
+
+# --- compact for the model, complete for the record -------------------------------------
+#
+# The projections themselves are tested in test_compact.py. What matters here is the split:
+# the request carries the projection, and everything that is a *record* - the session log,
+# `to_dict()` for the UI, `_pending_patch` - still carries the full tool output. Getting
+# that backwards would either cost the tokens anyway or quietly gut the session log the
+# external cost comparison depends on.
+
+
+def full_netlist_json():
+    from tests.test_compact import RCLP_NETLIST
+
+    return json.dumps(RCLP_NETLIST, indent=2)
+
+
+def test_the_model_sees_the_projection_while_the_record_keeps_the_full_result(session):
+    client = FakeClient(
+        [
+            wants_tools("Reading it.", [("read_netlist", {"path": "c.asc"})]),
+            answer("R1's left pin is on NC_01, so Vin never reaches the filter."),
+        ]
+    )
+    full = full_netlist_json()
+    history: list[dict] = []
+
+    result = run_agent_turn(
+        client,
+        session,
+        "why is there no gain",
+        tools=[{"name": "read_netlist", "description": "", "input_schema": {}}],
+        tool_executor=lambda name, arguments: full,
+        history=history,
+        compactor=compact_tool_result,
+    )
+
+    sent = tool_results(history[2])[0]["content"]
+    assert "R1 Vout NC_01 10k" in sent
+    assert "spice_mcp_work" not in sent
+    assert len(sent) < len(full) / 4
+
+    record = result.tool_calls[0]
+    assert record.result == full
+    assert record.to_dict()["result"] == full
+    # `to_dict` is what reaches the session log and the UI, so the projection must not
+    # appear there under any key - a reader reconstructing the turn needs the real output.
+    assert "model_result" not in record.to_dict()
+
+    logged = [t for t in session.to_dict()["turns"] if t["role"] == "tool"]
+    assert logged[0]["text"] == full
+
+
+def test_the_projection_reaches_the_model_in_prompted_mode_too(session):
+    """Both modes converge on `_execute_tool`, so neither can be the one that leaks bulk."""
+    client = FakeClient(
+        [
+            prompted({"type": "tool_call", "name": "read_netlist", "arguments": {"path": "c.asc"}}),
+            prompted({"type": "answer", "text": "R1's pin is dangling on NC_01."}),
+        ]
+    )
+    full = full_netlist_json()
+    history: list[dict] = []
+
+    run_prompted(
+        client,
+        session,
+        "why is there no gain",
+        tool_executor=lambda name, arguments: full,
+        history=history,
+        compactor=compact_tool_result,
+    )
+
+    result_message = history[2]["content"]
+    assert result_message.startswith("TOOL RESULT")
+    assert "R1 Vout NC_01 10k" in result_message
+    assert "netlist_path" not in result_message
+
+
+def test_no_compactor_means_the_full_result_goes_to_the_model(session):
+    """The default, and what every other test in this file relies on.
+
+    Compaction is the caller's decision; the loop must not acquire an opinion of its own.
+    """
+    client = FakeClient(
+        [
+            wants_tools("", [("read_netlist", {"path": "c.asc"})]),
+            answer("done"),
+        ]
+    )
+    full = full_netlist_json()
+    history: list[dict] = []
+
+    run_agent_turn(
+        client,
+        session,
+        "q",
+        tools=[{"name": "read_netlist", "description": "", "input_schema": {}}],
+        tool_executor=lambda name, arguments: full,
+        history=history,
+    )
+
+    assert tool_results(history[2])[0]["content"] == full
+
+
+def test_a_declining_compactor_sends_the_result_unchanged(session):
+    """`None` is the fail-open answer, and it has to survive the plumbing.
+
+    An error result - the approval gate's REFUSED prose, for instance - travels this path,
+    and it is often the actual diagnosis.
+    """
+    client = FakeClient(
+        [
+            wants_tools("", [("patch_component_value", {"asc_path": "c.asc"})]),
+            answer("Here is the diff."),
+        ]
+    )
+    refusal = "REFUSED: writing to the schematic needs the user's approval first."
+    history: list[dict] = []
+
+    run_agent_turn(
+        client,
+        session,
+        "fix it",
+        tools=[{"name": "patch_component_value", "description": "", "input_schema": {}}],
+        tool_executor=lambda name, arguments: refusal,
+        history=history,
+        compactor=compact_tool_result,
+    )
+
+    assert tool_results(history[2])[0]["content"] == refusal
+
+
+def test_token_accounting_still_sums_across_rounds_with_compaction_active(session):
+    """The metric the whole experiment is judged on must not be the thing it breaks."""
+    client = FakeClient(
+        [
+            wants_tools("", [("read_netlist", {"path": "c.asc"})], input_tokens=900, output_tokens=40),
+            wants_tools("", [("run_simulation", {"path": "c.asc"})], input_tokens=700, output_tokens=30),
+            answer("It solves now.", input_tokens=800, output_tokens=120),
+        ]
+    )
+    full = full_netlist_json()
+
+    result = run_agent_turn(
+        client,
+        session,
+        "check it",
+        tools=[
+            {"name": "read_netlist", "description": "", "input_schema": {}},
+            {"name": "run_simulation", "description": "", "input_schema": {}},
+        ],
+        tool_executor=lambda name, arguments: full,
+        history=[],
+        compactor=compact_tool_result,
+    )
+
+    assert result.rounds == 3
+    assert (result.input_tokens, result.output_tokens) == (2400, 190)
+    data = session.to_dict()
+    assert data["total_input_tokens"] == 2400
+    assert data["total_output_tokens"] == 190
+    assert data["total_input_tokens"] == sum(t["input_tokens"] for t in data["turns"])
+    assert data["total_output_tokens"] == sum(t["output_tokens"] for t in data["turns"])
 
 
 # --- what the model is told when a circuit is selected ----------------------------------

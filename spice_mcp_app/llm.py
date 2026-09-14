@@ -186,6 +186,18 @@ class ToolExecutor(Protocol):
     def __call__(self, name: str, arguments: dict[str, Any]) -> str: ...
 
 
+class ResultCompactor(Protocol):
+    """Projects a tool result down to what the model needs, or declines.
+
+    Returning `None` means "send the result unchanged", which is the safe answer and the
+    behaviour when no compactor is supplied at all. `spice_mcp_app.compact` implements
+    this; the loop is deliberately given a callable rather than importing the module, so
+    the projections stay a caller's decision and the tests can drive the loop with none.
+    """
+
+    def __call__(self, name: str, result: str) -> str | None: ...
+
+
 class LLMError(RuntimeError):
     """A call to the model failed in a way worth showing the user."""
 
@@ -392,12 +404,24 @@ def prompted_tool_result_message(name: str, result: str) -> dict[str, Any]:
 
 @dataclass
 class ToolCallRecord:
-    """What happened on one tool call, for the session log and the UI."""
+    """What happened on one tool call, for the session log and the UI.
+
+    `result` is the complete tool output and is what everything except the model sees:
+    `to_dict()`, the `role="tool"` session turn, the UI's preview, and `api._pending_patch`.
+    `model_result` is the projection sent to the model when one was worth making, and is
+    deliberately *not* in `to_dict()` - see `text_for_model`.
+    """
 
     name: str
     arguments: dict[str, Any]
     result: str
     is_error: bool = False
+    model_result: str | None = None
+
+    @property
+    def text_for_model(self) -> str:
+        """What actually goes into the request. Falls back to the full result."""
+        return self.model_result if self.model_result is not None else self.result
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -567,11 +591,17 @@ def _execute_tool(
     name: str,
     arguments: dict[str, Any],
     on_progress: Callable[[str], None] | None,
+    compactor: ResultCompactor | None = None,
 ) -> ToolCallRecord:
     """Run one tool through the caller's executor and record what came back.
 
     The single place either mode reaches MCP. Both loops funnel through here, so the
-    approval gate the executor implements cannot be sidestepped by picking a mode.
+    approval gate the executor implements cannot be sidestepped by picking a mode - and so
+    that the model-facing projection is applied in exactly one place too.
+
+    `compactor` returning `None` means "send the result unchanged", which is what happens
+    when it is not supplied at all. It is only ever consulted for a successful call: an
+    error result is prose rather than JSON, and it is often the actual diagnosis.
     """
     if tool_executor is None:
         return ToolCallRecord(
@@ -581,13 +611,23 @@ def _execute_tool(
     if on_progress:
         on_progress(f"{name}({', '.join(f'{k}={v!r}' for k, v in arguments.items())})")
     try:
-        return ToolCallRecord(name, arguments, tool_executor(name, arguments), False)
+        result = tool_executor(name, arguments)
     except Exception as exc:
         # Hand the failure to the model rather than aborting: a bad path or an
         # unsupported file is something it can recover from by calling the tool
         # differently.
         log.warning("tool %s failed: %s", name, exc)
         return ToolCallRecord(name, arguments, f"Tool {name} failed: {exc}", True)
+
+    model_result = compactor(name, result) if compactor is not None else None
+    if model_result is not None:
+        log.debug(
+            "compacted the %s result for the model: %d -> %d chars",
+            name,
+            len(result),
+            len(model_result),
+        )
+    return ToolCallRecord(name, arguments, result, False, model_result)
 
 
 def _usage_tokens(usage: Any) -> tuple[int, int]:
@@ -672,6 +712,7 @@ def run_agent_turn(
     history: list[dict[str, Any]] | None = None,
     on_progress: Callable[[str], None] | None = None,
     tool_mode: str = TOOL_MODE_NATIVE,
+    compactor: ResultCompactor | None = None,
 ) -> AgentResult:
     """Run one user turn to completion, executing tool calls as the model asks.
 
@@ -684,6 +725,10 @@ def run_agent_turn(
     `tool_mode` selects how tools are offered - `native` sends the `tools` parameter,
     `prompted_json` puts the catalogue in the system prompt instead. See the module
     docstring for why both exist.
+
+    `compactor`, when given, projects each tool result down to what the model needs. The
+    full result is kept on the record either way, so the session log and the UI are
+    unaffected. Omitting it sends every result in full, which is what the tests do.
     """
     if tool_mode not in TOOL_MODES:
         raise LLMError(
@@ -698,9 +743,11 @@ def run_agent_turn(
 
     if tool_mode == TOOL_MODE_PROMPTED_JSON:
         return _run_prompted_turn(
-            client, session, tools, tool_executor, history, on_progress
+            client, session, tools, tool_executor, history, on_progress, compactor
         )
-    return _run_native_turn(client, session, tools, tool_executor, history, on_progress)
+    return _run_native_turn(
+        client, session, tools, tool_executor, history, on_progress, compactor
+    )
 
 
 def _run_native_turn(
@@ -710,6 +757,7 @@ def _run_native_turn(
     tool_executor: ToolExecutor | None,
     history: list[dict[str, Any]],
     on_progress: Callable[[str], None] | None,
+    compactor: ResultCompactor | None = None,
 ) -> AgentResult:
     """The native path: `tools` on the request, `tool_use` blocks on the reply."""
     records: list[ToolCallRecord] = []
@@ -753,7 +801,9 @@ def _run_native_turn(
                     True,
                 )
             else:
-                record = _execute_tool(tool_executor, name, arguments, on_progress)
+                record = _execute_tool(
+                    tool_executor, name, arguments, on_progress, compactor
+                )
 
             round_records.append(record)
             records.append(record)
@@ -761,7 +811,9 @@ def _run_native_turn(
                 {
                     "type": "tool_result",
                     "tool_use_id": _block_field(block, "id"),
-                    "content": record.result,
+                    # The projection, when there was one. `record.result` still holds the
+                    # full text for the session log and the UI.
+                    "content": record.text_for_model,
                     "is_error": record.is_error,
                 }
             )
@@ -797,6 +849,7 @@ def _run_prompted_turn(
     tool_executor: ToolExecutor | None,
     history: list[dict[str, Any]],
     on_progress: Callable[[str], None] | None,
+    compactor: ResultCompactor | None = None,
 ) -> AgentResult:
     """The prompted path, for routes that accept `tools` and then ignore it.
 
@@ -900,10 +953,12 @@ def _run_prompted_turn(
             )
 
         record = _execute_tool(
-            tool_executor, parsed["name"], parsed["arguments"], on_progress
+            tool_executor, parsed["name"], parsed["arguments"], on_progress, compactor
         )
         records.append(record)
         _log_round(session, text, usage, [record])
-        history.append(prompted_tool_result_message(record.name, record.result))
+        history.append(
+            prompted_tool_result_message(record.name, record.text_for_model)
+        )
 
     return _exhausted(records, total_in, total_out, protocol_errors)
