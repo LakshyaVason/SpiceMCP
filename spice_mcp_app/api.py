@@ -21,7 +21,7 @@ from typing import Any
 
 from spice_mcp_server.ltspice import ltspice_is_running
 
-from .compact import compact_tool_result
+from .compact import circuit_summary, compact_tool_result
 from .config import Config, ConfigError, load_config
 from .llm import (
     AgentResult,
@@ -210,7 +210,7 @@ class Api:
         except json.JSONDecodeError:
             checks = {"summary": raw, "findings": [], "ok": False}
 
-        note = self._selection_note(target, checks)
+        note = self._selection_note(target, checks, topology=self._preload_topology(target))
         # Folded into the pending user turn rather than appended as its own: the Messages
         # API rejects two user turns in a row, and the next question adds one.
         append_user_note(self._history, note)
@@ -223,11 +223,44 @@ class Api:
             warning=self._ltspice_open_warning(target),
         )
 
+    def _preload_topology(self, target: Path) -> str | None:
+        """The circuit summary for the selection note, or `None` if it could not be read.
+
+        The redundant `read_netlist` round in the baseline was not the model being
+        wasteful: the static *findings* were preloaded but the topology was not, so it
+        genuinely did not have the components it needed to name a fix. Telling it not to
+        call the tool without first supplying the data would have made it answer from
+        information it did not have.
+
+        Failure here is not an error for the caller. An ExpressPCB `.net`, a missing
+        LTspice, an unparseable file - the selection still succeeds, the summary is simply
+        absent, and `_selection_note` then does not claim the topology is loaded. That
+        pairing is the safety property: the model is never told it has data it does not.
+
+        `include_raw_text=False` because the projection drops `raw_text` anyway, so
+        carrying it over the MCP pipe would be pure overhead.
+        """
+        if self._mcp is None:
+            return None
+        try:
+            raw = self._mcp.call_tool(
+                "read_netlist", {"path": str(target), "include_raw_text": False}
+            )
+            payload = json.loads(raw)
+        except (MCPClientError, json.JSONDecodeError) as exc:
+            log.info("no topology preload for %s: %s", target, exc)
+            return None
+        if not isinstance(payload, dict):
+            return None
+        return circuit_summary(payload)
+
     @staticmethod
-    def _selection_note(target: Path, checks: dict[str, Any]) -> str:
+    def _selection_note(
+        target: Path, checks: dict[str, Any], *, topology: str | None = None
+    ) -> str:
         """The context injected when a circuit is selected.
 
-        Two jobs. First, the absolute path: the tools take a path argument rather than
+        Three jobs. First, the absolute path: the tools take a path argument rather than
         having an implicit "current circuit", and without being told, the model guesses a
         relative name the server then cannot find.
 
@@ -236,15 +269,32 @@ class Api:
         worst of both worlds - it told the model something was wrong without saying what,
         which is an invitation to re-run the same check to find out. Handing over the
         findings both saves that round trip and gives the model something to reason from.
+
+        Third, the topology, by the same argument one step further: the findings say *what*
+        is wrong, and the components say what to do about it. With both here a simple fault
+        needs no tool call at all.
+
+        **The list of what has already run is derived from what actually succeeded**, never
+        written as a fixed string. If the topology could not be read, the note says so and
+        points at `read_netlist`. A model told it has data it does not have would answer
+        from nothing, which is a worse failure than any number of redundant tool calls.
         """
         findings = checks.get("findings") or []
+        already_ran = ["check_netlist_static"] + (["read_netlist"] if topology else [])
         lines = [
             f"[The user has opened this circuit: {target}",
             "Use that exact absolute path in tool calls.",
-            "check_netlist_static has already run on it - the findings are below, so do "
-            "not run it again unless the file changes.",
-            f"static check: {checks.get('summary', 'n/a')}",
+            "Already run for you, with the real output below - this is tool output, not a "
+            "guess, so do not call these again unless the file changes: "
+            + ", ".join(already_ran)
+            + ".",
         ]
+        if not topology:
+            lines.append(
+                "The topology was NOT read - call read_netlist when you need components, "
+                "nodes or values."
+            )
+        lines.append(f"static check: {checks.get('summary', 'n/a')}")
         for finding in findings[:MAX_PRELOADED_FINDINGS]:
             if not isinstance(finding, dict):
                 continue
@@ -263,6 +313,8 @@ class Api:
                 f"- ...and {len(findings) - MAX_PRELOADED_FINDINGS} more; "
                 f"re-run check_netlist_static to see them all."
             )
+        if topology:
+            lines.append(topology)
         return "\n".join(lines) + "]"
 
     def _ltspice_open_warning(self, target: Path) -> str | None:
@@ -436,7 +488,12 @@ class Api:
         # the state of the file and it can verify against the real schematic.
         note = (
             f"[The user approved your fix. {ref} is now {new_value} in "
-            f"{resolved.name}; the file has been written.]"
+            f"{resolved.name}; the file has been written.\n"
+            # The file has changed, so the preloaded static check and topology above are now
+            # out of date. Without this, the policy telling the model not to re-run what has
+            # already run would suppress exactly the verification that matters most.
+            "The file has changed, so the preloaded static check and topology above are now "
+            "stale - re-read what you need to verify the fix.]"
         )
         append_user_note(self._history, note)
         self._session.add_turn(Turn(role="user", text=note))
