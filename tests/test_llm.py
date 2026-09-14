@@ -40,6 +40,7 @@ from spice_mcp_app.compact import compact_tool_result
 from spice_mcp_app.config import TOOL_MODE_NATIVE, TOOL_MODE_PROMPTED_JSON
 from spice_mcp_app.llm import (
     MAX_PROTOCOL_CORRECTIONS,
+    MAX_TOKENS,
     MAX_TOOL_ROUNDS,
     SYSTEM_PROMPT,
     GatewayClient,
@@ -221,6 +222,67 @@ def test_translation_substitutes_an_empty_schema():
 
 def test_translation_skips_nameless_tools():
     assert mcp_tools_to_anthropic([{"description": "no name"}]) == []
+
+
+# --- the response policy in the system prompt -------------------------------------------
+#
+# The prompt is the only lever on verbosity that exists here: `temperature` was removed from
+# Claude Opus 5 and is a 400 on this gateway, and a small `max_tokens` would truncate a
+# legitimate answer rather than shorten it. So these assertions are on prompt *text* - weak
+# evidence about the model, but the strongest available offline, and enough to fail loudly if
+# a future edit puts the lecture back.
+
+
+def test_the_prompt_asks_for_fault_then_fix_then_reason():
+    ordering = SYSTEM_PROMPT.index("Lead with the fault. Then the specific fix.")
+    assert ordering > 0
+    assert "two to\n    five sentences" in SYSTEM_PROMPT
+
+
+def test_the_prompt_rules_out_the_three_digressions_from_the_baseline():
+    """The baseline answer added divider gain, a cutoff derivation and an aside about
+    `AC 0.7 3000`, to a question that asked about none of them."""
+    assert "do not tour the" in SYSTEM_PROMPT
+    assert "characteristics the user did not ask about" in SYSTEM_PROMPT
+    assert "secondary observations unless they change the answer" in SYSTEM_PROMPT
+    # And the instruction that invited the arithmetic in the first place is gone.
+    assert "Show the numbers you relied on" not in SYSTEM_PROMPT
+
+
+def test_brevity_is_a_default_and_not_a_ceiling():
+    """A hard cap would be the wrong fix: a genuinely hard circuit has to be allowed room,
+    and a stated spec still has to be checked arithmetically and shown."""
+    assert "Brevity is the default, not a ceiling." in SYSTEM_PROMPT
+    assert "show the arithmetic when you do" in SYSTEM_PROMPT
+    assert MAX_TOKENS == 16000
+
+
+def test_the_generic_tool_ordering_is_gone():
+    """`read_netlist -> check_netlist_static -> run_simulation` as a numbered sequence is
+    what produced the redundant round: the model followed the list rather than asking what
+    it was missing."""
+    assert "An efficient order of work" not in SYSTEM_PROMPT
+    assert "1. read_netlist" not in SYSTEM_PROMPT
+    assert "There is no fixed order." in SYSTEM_PROMPT
+    assert "Verified information already in this conversation counts as read." in SYSTEM_PROMPT
+    assert "Call a tool only for something you do not already have." in SYSTEM_PROMPT
+
+
+def test_the_ltspice_correctness_facts_survive_the_rewrite():
+    """These are why the answers are right, and they are cheap. Cutting them to save tokens
+    would be trading correctness for the metric."""
+    assert "M means milli, not mega" in SYSTEM_PROMPT
+    assert 'A simulation that "succeeds" can still be wrong.' in SYSTEM_PROMPT
+    assert "Neither subsumes the" in SYSTEM_PROMPT
+    assert "can still have a wrong value" in SYSTEM_PROMPT
+
+
+def test_the_prompted_protocol_carries_the_same_evidence_rule():
+    """Prompted mode gets its own copy of the header, so a rule added only to the shared
+    prompt would still apply - but the protocol rules are what that mode's model reads most
+    closely, and the redundant call is a protocol-shaped mistake there."""
+    protocol = prompted_protocol_prompt([])
+    assert "already stated in this conversation as tool output" in protocol
 
 
 # --- the loop -------------------------------------------------------------------------
