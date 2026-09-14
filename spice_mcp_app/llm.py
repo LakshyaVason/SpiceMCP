@@ -469,33 +469,75 @@ class GatewayClient:
                 tools=tools or anthropic.NOT_GIVEN,
                 stop_sequences=stop_sequences or anthropic.NOT_GIVEN,
             )
-        except anthropic.NotFoundError as exc:
+        except anthropic.APIError as exc:
+            raise self._as_llm_error(exc) from exc
+
+    def count_tokens(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        tools: list[dict[str, Any]] | None = None,
+        system: str = SYSTEM_PROMPT,
+    ) -> int:
+        """Input tokens for a request we do not intend to pay for.
+
+        The free way to measure a prompt, a tool catalogue or a preload change: the
+        gateway prices the input and runs no inference. That is what makes it possible to
+        attribute a token saving to the change that caused it instead of reporting one
+        lump sum at the end, without paying for a completion per iteration.
+
+        Not called from the agent loop - only from `scripts/measure_turn.py`. Measuring
+        every real turn would double the request count to learn a number `usage` already
+        reports for free.
+        """
+        try:
+            counted = self._client.messages.count_tokens(
+                model=self._config.model,
+                system=system,
+                messages=messages,
+                tools=tools or anthropic.NOT_GIVEN,
+            )
+        except anthropic.APIError as exc:
+            raise self._as_llm_error(exc) from exc
+        return int(getattr(counted, "input_tokens", 0) or 0)
+
+    def _as_llm_error(self, exc: anthropic.APIError) -> LLMError:
+        """Translate an SDK error into one worth showing the user.
+
+        Shared by every request this class makes, so a new endpoint cannot accidentally
+        surface the SDK's own wording - which for a 404 reads like a broken URL when the
+        real cause is the gateway's routing table.
+
+        Ordered most specific first: `NotFoundError` and friends are all subclasses of
+        `APIError`, so a broad branch placed above a narrow one would swallow it.
+        """
+        if isinstance(exc, anthropic.NotFoundError):
             # A 404 from the gateway is about its routing table, not about this machine.
-            # Worth saying so: the SDK's own message reads like a broken URL.
-            raise LLMError(
+            return LLMError(
                 f"The gateway did not route {self._config.model!r}.\n\n"
                 "Either it does not offer that model id or this token is not entitled "
                 "to it. Set SPICE_MCP_MODEL in .env to an id the gateway serves.\n\n"
                 f"Endpoint: {self._config.messages_url}\n\n{exc}"
-            ) from exc
-        except (anthropic.AuthenticationError, anthropic.PermissionDeniedError) as exc:
+            )
+        if isinstance(
+            exc, (anthropic.AuthenticationError, anthropic.PermissionDeniedError)
+        ):
             # Split from the 404 on purpose - the two used to share a branch because on
             # Bedrock both meant "no model access", but here they mean different things
             # and send the reader to different places.
-            raise LLMError(
+            return LLMError(
                 f"The gateway rejected the credential "
                 f"({self._config.credentials_source}).\n\n"
                 f"Check that {TOKEN_ENV_VAR} in .env is current and entitled to "
                 f"{self._config.model}.\n\n{exc}"
-            ) from exc
-        except anthropic.APIConnectionError as exc:
-            raise LLMError(
+            )
+        if isinstance(exc, anthropic.APIConnectionError):
+            return LLMError(
                 f"Could not reach {self._config.messages_url}.\n\n"
                 "The request never got an HTTP status back, so this is a network or VPN "
                 f"problem rather than a configuration one.\n\n{exc}"
-            ) from exc
-        except anthropic.APIError as exc:
-            raise LLMError(f"The gateway call failed: {exc}") from exc
+            )
+        return LLMError(f"The gateway call failed: {exc}")
 
 
 def _block_field(block: Any, name: str) -> Any:
