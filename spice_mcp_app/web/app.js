@@ -215,6 +215,9 @@ $("input").addEventListener("keydown", (event) => {
   // Enter sends; Shift+Enter is a newline.
   if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); send(); }
 });
+$("effort-mode").addEventListener("change", async (event) => {
+  await window.pywebview.api.set_effort_mode(event.target.value);
+});
 
 async function send() {
   const input = $("input");
@@ -245,7 +248,11 @@ async function send() {
   let html = "";
   if (result.tool_calls && result.tool_calls.length) html += renderToolCalls(result.tool_calls);
   html += renderMarkdown(result.text);
-  html += `<div class="muted tiny">${result.usage.input_tokens} in · ${result.usage.output_tokens} out · ${result.rounds} round${result.rounds === 1 ? "" : "s"}</div>`;
+  const offeredCount = (result.tools_offered || []).length;
+  const offeredNote = offeredCount === 0
+    ? " · zero tools (preloaded)"
+    : ` · ${offeredCount} tool${offeredCount === 1 ? "" : "s"} offered`;
+  html += `<div class="muted tiny">${result.usage.input_tokens} in · ${result.usage.output_tokens} out · ${result.rounds} round${result.rounds === 1 ? "" : "s"}${offeredNote}</div>`;
   bubble("assistant", html);
 
   updateTotals(result.totals);

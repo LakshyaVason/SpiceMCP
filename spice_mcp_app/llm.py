@@ -317,8 +317,15 @@ def prompted_system_prompt(tools: Iterable[dict[str, Any]] | None) -> str:
     Built per request rather than stored, because the Messages API has no system *role*:
     the system prompt is a top-level parameter on every call, so there is nowhere in the
     message history to keep it. A `{"role": "system"}` message is a 400.
+
+    When tools is empty the protocol header is omitted entirely: there is nothing to call,
+    the model should answer in plain text, and paying for the header tokens on every round
+    would be pure waste.
     """
-    return SYSTEM_PROMPT + "\n\n" + prompted_protocol_prompt(tools)
+    tool_list = list(tools or [])
+    if not tool_list:
+        return SYSTEM_PROMPT
+    return SYSTEM_PROMPT + "\n\n" + prompted_protocol_prompt(tool_list)
 
 
 def _strip_code_fence(text: str) -> str:
@@ -512,8 +519,15 @@ class GatewayClient:
         system: str = SYSTEM_PROMPT,
         max_tokens: int = MAX_TOKENS,
         stop_sequences: list[str] | None = None,
+        effort: str | None = None,
     ) -> Any:
-        """One turn. Returns the SDK's Message object."""
+        """One turn. Returns the SDK's Message object.
+
+        `effort` is a per-request override. When given it takes precedence over
+        `self._config.effort`. Pass None to use the configured default (or no
+        output_config at all when the config is also unset).
+        """
+        effective_effort = effort if effort is not None else self._config.effort
 
         def send() -> Any:
             return self._client.messages.create(
@@ -523,31 +537,33 @@ class GatewayClient:
                 messages=messages,
                 tools=tools or anthropic.NOT_GIVEN,
                 stop_sequences=stop_sequences or anthropic.NOT_GIVEN,
-                output_config=self._output_config(),
+                output_config=self._output_config(effective_effort),
             )
 
         try:
             return send()
         except anthropic.BadRequestError as exc:
             # Must sit above the APIError branch - BadRequestError is a subclass of it.
-            if self._disable_effort_if_rejected(exc):
+            if self._disable_effort_if_rejected(exc, effective_effort=effective_effort):
                 return send()  # once, and only after the parameter is off
             raise self._as_llm_error(exc) from exc
         except anthropic.APIError as exc:
             raise self._as_llm_error(exc) from exc
 
-    def _output_config(self) -> Any:
+    def _output_config(self, effort: str | None = None) -> Any:
         """`{"effort": ...}` when it is set and known to work, otherwise NOT_GIVEN.
 
         Omitted rather than sent with a default value: `high` is already the model's own
         default, and sending it explicitly would make an unset configuration
         indistinguishable from a deliberate one in the gateway's logs and in ours.
         """
-        if not self._config.effort or not self._effort_supported:
+        if not effort or not self._effort_supported:
             return anthropic.NOT_GIVEN
-        return {"effort": self._config.effort}
+        return {"effort": effort}
 
-    def _disable_effort_if_rejected(self, exc: anthropic.BadRequestError) -> bool:
+    def _disable_effort_if_rejected(
+        self, exc: anthropic.BadRequestError, *, effective_effort: str | None = None
+    ) -> bool:
         """Turn `output_config` off for the rest of the process if the gateway refused it.
 
         Narrow on purpose: only a 400 that names the parameter counts, and only while it was
@@ -555,7 +571,7 @@ class GatewayClient:
         behind a second identical failure, and the message the user needs would be the one
         thrown away.
         """
-        if not self._config.effort or not self._effort_supported:
+        if not effective_effort or not self._effort_supported:
             return False
         text = str(exc).lower()
         if "output_config" not in text and "effort" not in text:
@@ -563,7 +579,7 @@ class GatewayClient:
         log.warning(
             "the gateway rejected output_config={'effort': %r}; continuing without it. "
             "Unset SPICE_MCP_EFFORT to silence this.",
-            self._config.effort,
+            effective_effort,
         )
         self._effort_supported = False
         return True
@@ -574,6 +590,7 @@ class GatewayClient:
         *,
         tools: list[dict[str, Any]] | None = None,
         system: str = SYSTEM_PROMPT,
+        effort: str | None = None,
     ) -> int:
         """Input tokens for a request we do not intend to pay for.
 
@@ -586,19 +603,21 @@ class GatewayClient:
         every real turn would double the request count to learn a number `usage` already
         reports for free.
         """
+        effective_effort = effort if effort is not None else self._config.effort
+
         def send() -> Any:
             return self._client.messages.count_tokens(
                 model=self._config.model,
                 system=system,
                 messages=messages,
                 tools=tools or anthropic.NOT_GIVEN,
-                output_config=self._output_config(),
+                output_config=self._output_config(effective_effort),
             )
 
         try:
             counted = send()
         except anthropic.BadRequestError as exc:
-            if self._disable_effort_if_rejected(exc):
+            if self._disable_effort_if_rejected(exc, effective_effort=effective_effort):
                 counted = send()
             else:
                 raise self._as_llm_error(exc) from exc
@@ -794,6 +813,7 @@ def run_agent_turn(
     on_progress: Callable[[str], None] | None = None,
     tool_mode: str = TOOL_MODE_NATIVE,
     compactor: ResultCompactor | None = None,
+    effort: str | None = None,
 ) -> AgentResult:
     """Run one user turn to completion, executing tool calls as the model asks.
 
@@ -824,10 +844,12 @@ def run_agent_turn(
 
     if tool_mode == TOOL_MODE_PROMPTED_JSON:
         return _run_prompted_turn(
-            client, session, tools, tool_executor, history, on_progress, compactor
+            client, session, tools, tool_executor, history, on_progress, compactor,
+            effort=effort,
         )
     return _run_native_turn(
-        client, session, tools, tool_executor, history, on_progress, compactor
+        client, session, tools, tool_executor, history, on_progress, compactor,
+        effort=effort,
     )
 
 
@@ -839,6 +861,8 @@ def _run_native_turn(
     history: list[dict[str, Any]],
     on_progress: Callable[[str], None] | None,
     compactor: ResultCompactor | None = None,
+    *,
+    effort: str | None = None,
 ) -> AgentResult:
     """The native path: `tools` on the request, `tool_use` blocks on the reply."""
     records: list[ToolCallRecord] = []
@@ -846,7 +870,7 @@ def _run_native_turn(
     total_out = 0
 
     for round_index in range(1, MAX_TOOL_ROUNDS + 1):
-        response = client.complete(history, tools=tools)
+        response = client.complete(history, tools=tools, effort=effort)
         usage = _block_field(response, "usage")
         round_in, round_out = _usage_tokens(usage)
         total_in += round_in
@@ -931,6 +955,8 @@ def _run_prompted_turn(
     history: list[dict[str, Any]],
     on_progress: Callable[[str], None] | None,
     compactor: ResultCompactor | None = None,
+    *,
+    effort: str | None = None,
 ) -> AgentResult:
     """The prompted path, for routes that accept `tools` and then ignore it.
 
@@ -939,9 +965,15 @@ def _run_prompted_turn(
     "the model ignored it" and "the model chose not to use it". The catalogue goes into
     the system prompt instead, which the Messages API takes as a top-level parameter on
     every call - there is no system *role* to put it in the history once.
+
+    Zero-tools path: when `tools` is an empty list, `prompted_system_prompt` returns just
+    `SYSTEM_PROMPT` (no protocol header). In that case the model should answer in plain text
+    and we return immediately without JSON parsing, stop sequences, or correction rounds.
     """
-    known = tool_names(tools)
-    system = prompted_system_prompt(tools)
+    tool_list = list(tools or [])
+    no_tools_mode = not bool(tool_list)
+    known = tool_names(tool_list)
+    system = prompted_system_prompt(tool_list)
     records: list[ToolCallRecord] = []
     total_in = 0
     total_out = 0
@@ -950,8 +982,25 @@ def _run_prompted_turn(
 
     for round_index in range(1, MAX_TOOL_ROUNDS + 1):
         response = client.complete(
-            history, system=system, stop_sequences=PROMPTED_STOP
+            history,
+            system=system,
+            stop_sequences=None if no_tools_mode else PROMPTED_STOP,
+            effort=effort,
         )
+
+        # Zero-tools fast path: no JSON to parse, return the plain text immediately.
+        if no_tools_mode:
+            usage = _block_field(response, "usage")
+            round_in, round_out = _usage_tokens(usage)
+            text = _response_text(response)
+            _log_round(session, text, usage, [])
+            return AgentResult(
+                text=text,
+                tool_calls=[],
+                rounds=round_index,
+                input_tokens=round_in,
+                output_tokens=round_out,
+            )
         usage = _block_field(response, "usage")
         truncated = _block_field(response, "stop_reason") == "max_tokens"
         round_in, round_out = _usage_tokens(usage)

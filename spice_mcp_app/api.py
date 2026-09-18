@@ -21,8 +21,10 @@ from typing import Any
 
 from spice_mcp_server.ltspice import ltspice_is_running
 
+from .cache import TopologyCache
 from .compact import circuit_summary, compact_tool_result
 from .config import Config, ConfigError, load_config
+from .effort import PreloadState, UI_MODE_MAP, classify_effort
 from .llm import (
     AgentResult,
     GatewayClient,
@@ -33,6 +35,7 @@ from .llm import (
 )
 from .mcp_client import MCPClientError, SpiceMCP, find_circuits
 from .session import Session, Turn
+from .tool_policy import select_tools
 
 log = logging.getLogger(__name__)
 
@@ -43,23 +46,6 @@ PATCH_TOOL = "patch_component_value"
 # the model's starting point, not the whole record, and the full result stays in the UI and
 # the session log either way.
 MAX_PRELOADED_FINDINGS = 12
-
-# Tools withheld from the *model's* catalogue during ordinary diagnosis. The seven schemas
-# cost 6588 chars of description and JSON schema on every round - in prompted mode all of it
-# sits in the system prompt - and these two are 1342 of it. Neither is reachable from a
-# diagnosis or from the Apply flow: `diff_netlist` compares two files the user would have to
-# name, and `export_netlist` writes a `.net` nothing here asks for.
-#
-# `patch_component_value` is deliberately **not** in this list even though it is the largest
-# single schema. Without a model call there is no `pending_patch`, so no diff panel and no
-# Apply button, and the whole approval flow dies. Saving tokens by removing the feature is
-# not saving tokens.
-WITHHELD_FROM_DIAGNOSIS = ("diff_netlist", "export_netlist")
-
-# Words that put them back for one turn. The rule can only ever *widen* the catalogue, which
-# is the only shape that is safe: a rule that withholds on a guess can block a legitimate
-# workflow, while a rule that offers too much only costs the tokens it was meant to save.
-WIDEN_KEYWORDS = ("diff", "compar", "export", "before and after", ".net")
 
 
 def _ok(**payload: Any) -> dict[str, Any]:
@@ -89,6 +75,10 @@ class Api:
         self._history: list[dict[str, Any]] = []
         self._approved: set[tuple[str, str, str]] = set()
         self._lock = threading.Lock()  # one agent turn at a time
+        # Adaptive context state — reset each time a circuit is selected.
+        self._preload_state: PreloadState | None = None
+        self._effort_ui_mode: str = "auto"
+        self._topology_cache: TopologyCache = TopologyCache()
         # The leading underscore is load-bearing, not style. pywebview builds the JS bridge
         # by recursively walking every *public* attribute of this object
         # (webview/util.py:180-211) and it skips names starting with "_". Public, this held a
@@ -220,6 +210,9 @@ class Api:
         if not target.is_file():
             return _err(f"No such file: {target}")
 
+        # Reset preload state before any new circuit loads.
+        self._preload_state = None
+
         self._session.set_circuit_file(str(target))
         try:
             raw = self._mcp.call_tool("check_netlist_static", {"path": str(target)})
@@ -231,7 +224,16 @@ class Api:
         except json.JSONDecodeError:
             checks = {"summary": raw, "findings": [], "ok": False}
 
-        note = self._selection_note(target, checks, topology=self._preload_topology(target))
+        topology = self._preload_topology(target)
+
+        # Record what was successfully loaded so tool_policy and classify_effort can use it.
+        self._preload_state = PreloadState(
+            topology_ok=topology is not None,
+            static_ok=isinstance(checks, dict) and "findings" in checks,
+            static_finding_count=len((checks or {}).get("findings") or []),
+        )
+
+        note = self._selection_note(target, checks, topology=topology)
         # Folded into the pending user turn rather than appended as its own: the Messages
         # API rejects two user turns in a row, and the next question adds one.
         append_user_note(self._history, note)
@@ -260,12 +262,23 @@ class Api:
 
         `include_raw_text=False` because the projection drops `raw_text` anyway, so
         carrying it over the MCP pipe would be pure overhead.
+
+        The topology cache avoids re-running the LTspice subprocess when the same circuit
+        is re-selected without changes. Cache reduces *latency* only — the topology string
+        ends up in conversation history and is billed on every subsequent request regardless.
         """
         if self._mcp is None:
             return None
+
+        path_str = str(target)
+        cached = self._topology_cache.get(path_str)
+        if cached is not None:
+            log.debug("topology cache hit for %s", target)
+            return cached
+
         try:
             raw = self._mcp.call_tool(
-                "read_netlist", {"path": str(target), "include_raw_text": False}
+                "read_netlist", {"path": path_str, "include_raw_text": False}
             )
             payload = json.loads(raw)
         except (MCPClientError, json.JSONDecodeError) as exc:
@@ -273,7 +286,11 @@ class Api:
             return None
         if not isinstance(payload, dict):
             return None
-        return circuit_summary(payload)
+
+        summary = circuit_summary(payload)
+        if summary is not None:
+            self._topology_cache.put(path_str, summary)
+        return summary
 
     @staticmethod
     def _selection_note(
@@ -395,22 +412,32 @@ class Api:
         return self._mcp.call_tool(name, arguments)
 
     def _model_tools(self, text: str) -> list[dict[str, Any]]:
-        """The catalogue for this turn: all seven, minus the two nothing here reaches.
+        """The catalogue for this turn, selected by intent and preload state.
 
         `self._tools` stays the full set - `start()` reports it, and the server's seven are
         pinned by `tests/test_write_conflict.py`. This is only about what each *request*
         pays for.
 
-        The keyword trigger widens and never narrows. If the user asks about a diff, a
-        comparison or an export, they get the whole catalogue for that turn; asking about
-        anything else cannot take a tool away that the withheld list did not already name.
+        Delegates to `tool_policy.select_tools`, which uses `_preload_state` to determine
+        which tools are actually needed. Zero tools means "answer from what you already have".
         """
         if not self._tools:
             return self._tools
-        lowered = (text or "").lower()
-        if any(word in lowered for word in WIDEN_KEYWORDS):
-            return list(self._tools)
-        return [t for t in self._tools if t["name"] not in WITHHELD_FROM_DIAGNOSIS]
+        return select_tools(self._tools, text, self._preload_state)
+
+    def set_effort_mode(self, mode: str) -> dict[str, Any]:
+        """Set the reasoning-effort mode for subsequent turns.
+
+        Accepts "auto" | "light" | "medium" | "hard". Does NOT modify the session log
+        schema — effort is logged via logging.info() only so the frozen schema is not
+        disturbed.
+        """
+        valid = {"auto", "light", "medium", "hard"}
+        if mode not in valid:
+            return _err(f"Unknown effort mode {mode!r}. Use one of: {', '.join(sorted(valid))}.")
+        self._effort_ui_mode = mode
+        log.info("effort UI mode set to %r", mode)
+        return _ok(effort_mode=mode)
 
     def send_message(self, text: str) -> dict[str, Any]:
         """Run one user turn to completion and return the assistant's answer."""
@@ -418,6 +445,15 @@ class Api:
             return _err("The session is not started.")
         if not text or not text.strip():
             return _err("Type a message first.")
+
+        # Resolve effort before acquiring the lock — classify_effort is pure/fast.
+        if self._effort_ui_mode == "auto":
+            effort = classify_effort(text, self._preload_state)
+        else:
+            effort = UI_MODE_MAP.get(self._effort_ui_mode)
+        log.info("effort: ui_mode=%r → %r", self._effort_ui_mode, effort)
+
+        tools = self._model_tools(text)
 
         if not self._lock.acquire(blocking=False):
             return _err("A turn is already running.")
@@ -427,7 +463,7 @@ class Api:
                 self._client,
                 self._session,
                 text.strip(),
-                tools=self._model_tools(text),
+                tools=tools,
                 tool_executor=self._tool_executor,
                 history=self._history,
                 on_progress=progress.append,
@@ -436,6 +472,7 @@ class Api:
                 # goes into the request, `record.result` below is still the full text the
                 # session log, the UI preview and `_pending_patch` read.
                 compactor=compact_tool_result,
+                effort=effort,
             )
         except LLMError as exc:
             return _err(str(exc))
@@ -452,6 +489,7 @@ class Api:
             },
             totals=self.totals()["totals"],
             pending_patch=self._pending_patch(result),
+            tools_offered=[t["name"] for t in tools],
         )
 
     def _present_tool_call(self, record: Any) -> dict[str, Any]:
@@ -522,6 +560,11 @@ class Api:
             return _err(raw)
         if not payload.get("applied"):
             return _err(payload.get("summary", raw))
+
+        # Invalidate the topology cache and preload state: the file has been rewritten, so
+        # any cached summary is stale and the next tool-policy decision must start fresh.
+        self._topology_cache.invalidate(str(resolved.resolve()))
+        self._preload_state = None
 
         # Tell the model what the user did, so the conversation stays truthful about
         # the state of the file and it can verify against the real schematic.

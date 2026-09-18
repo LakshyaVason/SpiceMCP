@@ -137,8 +137,7 @@ def count_only(api: Api, question: str, tool_mode: str) -> dict[str, Any]:
     append_user_note(history, question)
 
     # The catalogue the *request* carries, not the seven the server exposes: `_model_tools`
-    # withholds the two a diagnosis cannot reach, and pricing the full set would credit the
-    # trim with nothing.
+    # uses tool_policy to select based on preload state.
     catalogue = api._model_tools(question)
     if tool_mode == TOOL_MODE_PROMPTED_JSON:
         system = prompted_system_prompt(catalogue)
@@ -158,6 +157,74 @@ def count_only(api: Api, question: str, tool_mode: str) -> dict[str, Any]:
         "system_chars": len(system),
         "tool_catalogue_names": [t["name"] for t in catalogue],
         "tools_sent": len(catalogue),
+    }
+
+
+def breakdown(api: Api, question: str, tool_mode: str) -> dict[str, Any]:
+    """Five-pass attribution: how much does each component cost?
+
+    Sends five free count_tokens calls, each adding one more component:
+      1. system_only      — base system prompt, no tools, empty history, empty user msg
+      2. + tools          — add the tool catalogue
+      3. + user_msg       — add the user message
+      4. + history        — add the full preloaded history (selection note, prior turns)
+      5. full             — all of the above combined (verification, should match #4)
+
+    The purpose is attribution: which component is responsible for a token saving after
+    a change? Input tokens are all that matter here; output tokens and rounds come from a
+    live run.
+
+    The "full" count should equal the count_only() result. If it differs, the breakdown
+    is counting something the real request does not, which would be a bug worth knowing.
+    """
+    assert api._client is not None
+    catalogue = api._model_tools(question)
+    if tool_mode == TOOL_MODE_PROMPTED_JSON:
+        full_system = prompted_system_prompt(catalogue)
+        full_tools = None
+    else:
+        full_system = SYSTEM_PROMPT
+        full_tools = catalogue
+
+    # The preloaded history (selection note, any prior turns). Excluding the user message.
+    history_only = copy.deepcopy(api._history)
+
+    # Full history with the user message appended.
+    full_history = copy.deepcopy(api._history)
+    append_user_note(full_history, question)
+
+    empty: list = []
+    user_only = [{"role": "user", "content": question}]
+
+    def count(msgs, *, sys=SYSTEM_PROMPT, t=None):
+        return api._client.count_tokens(msgs, tools=t, system=sys)
+
+    c_system_only = count(empty, sys=SYSTEM_PROMPT)
+    c_with_tools = count(empty, sys=full_system, t=full_tools)
+    c_with_user = count(user_only, sys=full_system, t=full_tools)
+    c_with_history = count(full_history, sys=full_system, t=full_tools)
+    c_full = count(full_history, sys=full_system, t=full_tools)  # same as above, for verification
+
+    return {
+        "question": question,
+        "ok": True,
+        "breakdown": True,
+        "tool_mode": tool_mode,
+        "tool_catalogue_names": [t["name"] for t in catalogue],
+        "tools_sent": len(catalogue),
+        "system_chars": len(full_system),
+        "components": {
+            "system_only": c_system_only,
+            "plus_tools": c_with_tools,
+            "plus_user_msg": c_with_user,
+            "plus_history": c_with_history,
+            "full": c_full,
+        },
+        "deltas": {
+            "tools": c_with_tools - c_system_only,
+            "user_msg": c_with_user - c_with_tools,
+            "history": c_with_history - c_with_user,
+        },
     }
 
 
@@ -199,6 +266,20 @@ def report(rows: list[dict[str, Any]]) -> None:
         print(f"  question: {row['question']}")
         if not row.get("ok"):
             print(f"  FAILED: {row.get('error')}")
+            continue
+        if row.get("breakdown"):
+            print(f"  mode:          {row['tool_mode']}")
+            print(f"  system prompt: {row['system_chars']} chars")
+            print(f"  tools sent:    {row['tools_sent']}")
+            c = row["components"]
+            d = row["deltas"]
+            print()
+            print("  Token attribution (cumulative / delta):")
+            print(f"    system_only:  {c['system_only']:>6}")
+            print(f"    + tools:      {c['plus_tools']:>6}  (+{d['tools']})")
+            print(f"    + user_msg:   {c['plus_user_msg']:>6}  (+{d['user_msg']})")
+            print(f"    + history:    {c['plus_history']:>6}  (+{d['history']})")
+            print(f"    full:         {c['full']:>6}  (verification)")
             continue
         if row.get("count_only"):
             print(f"  mode:          {row['tool_mode']}")
@@ -248,6 +329,10 @@ def main(argv: list[str] | None = None) -> int:
         "--count-only", action="store_true",
         help="Price the request without running inference. Free.",
     )
+    parser.add_argument(
+        "--breakdown", action="store_true",
+        help="Five-pass token attribution: system / tools / user_msg / history. Free.",
+    )
     parser.add_argument("--json", action="store_true", help="Print the rows as JSON too.")
     args = parser.parse_args(argv)
 
@@ -269,10 +354,11 @@ def main(argv: list[str] | None = None) -> int:
     shutil.copy2(source, circuit)
 
     api = Api(config)
+    free_mode = args.count_only or args.breakdown
     print(f"circuit:   {circuit}")
     print(f"model:     {config.model}")
     print(f"tool mode: {config.tool_mode}")
-    print(f"mode:      {'count-only (free)' if args.count_only else 'live (spends tokens)'}")
+    print(f"mode:      {'breakdown (free)' if args.breakdown else 'count-only (free)' if args.count_only else 'live (spends tokens)'}")
 
     rows: list[dict[str, Any]] = []
     try:
@@ -289,19 +375,21 @@ def main(argv: list[str] | None = None) -> int:
         print(f"static:    {selection['checks'].get('summary', 'n/a')}")
 
         for question in args.question:
-            if args.count_only:
+            if args.breakdown:
+                rows.append(breakdown(api, question, config.tool_mode))
+            elif args.count_only:
                 rows.append(count_only(api, question, config.tool_mode))
             else:
                 rows.append(measure(api, question, args.expect))
 
         report(rows)
 
-        problems = audit_session(api) if not args.count_only else []
+        problems = audit_session(api) if not free_mode else []
         session_path = api.reveal_session()["path"]
     finally:
         api.shutdown()
 
-    if not args.count_only:
+    if not free_mode:
         total_in = sum(r.get("input_tokens", 0) for r in rows)
         total_out = sum(r.get("output_tokens", 0) for r in rows)
         print()
@@ -318,7 +406,8 @@ def main(argv: list[str] | None = None) -> int:
         "model": config.model,
         "tool_mode": config.tool_mode,
         "count_only": args.count_only,
-        "session_log": None if args.count_only else session_path,
+        "breakdown": args.breakdown,
+        "session_log": None if free_mode else session_path,
         "rows": rows,
     }
     if args.json:
@@ -331,7 +420,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"wrote {out}")
 
     failed = [r for r in rows if not r.get("ok") or r.get("missing")]
-    if failed or (not args.count_only and problems):
+    if failed or (not free_mode and problems):
         print("\nFAILED: the run did not produce a correct, well-accounted answer.")
         return 1
     return 0

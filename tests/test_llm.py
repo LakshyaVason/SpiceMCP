@@ -116,6 +116,7 @@ class FakeClient:
         system=SYSTEM_PROMPT,
         max_tokens=None,
         stop_sequences=None,
+        effort=None,
     ):
         self.calls.append(
             {
@@ -123,6 +124,7 @@ class FakeClient:
                 "tools": tools,
                 "system": system,
                 "stop_sequences": stop_sequences,
+                "effort": effort,
             }
         )
         if not self._responses:
@@ -1448,9 +1450,12 @@ def test_no_tool_mode_can_write_without_approval(api, tmp_path, mode):
 
 # --- the model-facing catalogue ---------------------------------------------------------
 #
-# Seven tool schemas cost 6588 chars on every round. Two of them - `diff_netlist` and
-# `export_netlist`, 1342 chars - are not reachable from a diagnosis or from the Apply flow,
-# so they are withheld from the request while `self._tools` stays the full seven.
+# Tool selection is now driven by tool_policy.select_tools, which uses PreloadState to
+# decide the minimal needed set. Zero tools is valid when preload is complete and no
+# action intent is detected. The invariants tested here:
+#   - With no preload state, recovery tools are always exposed.
+#   - Widen keywords still return all 7.
+#   - The full set `self._tools` is never reduced; `start()` reports all 7.
 
 SEVEN_TOOLS = mcp_tools_to_anthropic(
     [
@@ -1468,33 +1473,6 @@ SEVEN_TOOLS = mcp_tools_to_anthropic(
 )
 
 
-def test_the_diagnosis_catalogue_drops_the_two_unreachable_tools(api):
-    api._tools = SEVEN_TOOLS
-
-    names = [t["name"] for t in api._model_tools("why is my circuit not getting any gain")]
-
-    assert names == [
-        "read_netlist",
-        "check_netlist_static",
-        "run_simulation",
-        "read_sim_log",
-        "patch_component_value",
-    ]
-    # The full set is untouched: `start()` reports it and `app_smoke.py` stage 1 counts it.
-    assert len(api._tools) == 7
-
-
-def test_patch_component_value_is_never_withheld(api):
-    """It is the largest single schema and the most tempting to cut.
-
-    Without a model call there is no `pending_patch`, so no diff panel, no Apply button and
-    no approval flow. Any turn text at all must still carry it.
-    """
-    api._tools = SEVEN_TOOLS
-    for text in ("why no gain", "export the netlist", "", "fix C1"):
-        assert PATCH_TOOL in [t["name"] for t in api._model_tools(text)]
-
-
 def test_asking_about_a_diff_or_an_export_widens_the_catalogue(api):
     """The trigger can only widen. A rule that withholds on a guess would block a
     legitimate workflow; one that offers too much merely costs the tokens it was saving."""
@@ -1509,6 +1487,7 @@ def test_asking_about_a_diff_or_an_export_widens_the_catalogue(api):
 
 
 def test_the_request_carries_the_trimmed_catalogue(api, tmp_path):
+    """With no preload state (no circuit selected), recovery tools are offered."""
     api._tools = SEVEN_TOOLS
     api._client = FakeClient([answer("No gain because R1's pin is on NC_01.")])
 
@@ -1516,8 +1495,10 @@ def test_the_request_carries_the_trimmed_catalogue(api, tmp_path):
 
     assert out["ok"], out.get("error")
     sent = [t["name"] for t in api._client.calls[0]["tools"]]
+    # No preload → recovery tools only (read_netlist + check_netlist_static)
     assert "diff_netlist" not in sent and "export_netlist" not in sent
-    assert PATCH_TOOL in sent
+    assert "read_netlist" in sent
+    assert "check_netlist_static" in sent
 
 
 # --- compact for the model, complete for the record -------------------------------------
@@ -1961,3 +1942,96 @@ def test_missing_credentials_is_reported_not_raised(tmp_path):
     assert "TAMU_API_KEY" in started["error"]
     # The banner has to say where to put it, or it is not actionable.
     assert ".env" in started["error"]
+
+
+# --- effort threading through run_agent_turn -----------------------------------------
+#
+# The per-request effort override must travel from run_agent_turn to GatewayClient.complete
+# in both modes, and the FakeClient now records it. This is additive: existing effort tests
+# in the GatewayClient section test the output_config parameter; these test the plumbing.
+
+
+@pytest.mark.parametrize("effort_value", [None, "low", "medium", "high"])
+def test_effort_threads_from_run_agent_turn_to_complete_native(session, effort_value):
+    client = FakeClient([answer("Done.")])
+
+    run_agent_turn(
+        client, session, "diagnose this",
+        tools=[{"name": "x"}],
+        effort=effort_value,
+        tool_mode=TOOL_MODE_NATIVE,
+    )
+
+    assert client.calls[0]["effort"] == effort_value
+
+
+@pytest.mark.parametrize("effort_value", [None, "low", "medium", "high"])
+def test_effort_threads_from_run_agent_turn_to_complete_prompted(session, effort_value):
+    client = FakeClient([prompted({"type": "answer", "text": "Done."})])
+
+    run_agent_turn(
+        client, session, "diagnose this",
+        tools=PROMPTED_TOOLS,
+        effort=effort_value,
+        tool_mode=TOOL_MODE_PROMPTED_JSON,
+    )
+
+    assert client.calls[0]["effort"] == effort_value
+
+
+# --- zero-tools prompted mode --------------------------------------------------------
+#
+# When tools=[] the prompted path must return plain text without JSON parsing or stop
+# sequences. The only cost should be the system prompt — no protocol header.
+
+
+def test_zero_tools_prompted_mode_returns_plain_text(session):
+    plain_answer = "The issue is R1 is disconnected."
+    client = FakeClient([
+        type("FakeResponse", (), {
+            "content": [type("TextBlock", (), {"type": "text", "text": plain_answer})()],
+            "stop_reason": "end_turn",
+            "usage": Usage(input_tokens=100, output_tokens=20),
+        })()
+    ])
+
+    result = run_agent_turn(
+        client, session, "why no gain",
+        tools=[],
+        tool_mode=TOOL_MODE_PROMPTED_JSON,
+    )
+
+    assert result.text == plain_answer
+    assert result.rounds == 1
+    assert result.tool_calls == []
+
+
+def test_zero_tools_prompted_mode_skips_protocol_header_in_system(session):
+    """When no tools are offered, the system prompt must not carry the protocol header."""
+    from spice_mcp_app.llm import PROMPTED_PROTOCOL_HEADER, SYSTEM_PROMPT
+
+    client = FakeClient([prompted({"type": "answer", "text": "All good."})])
+
+    run_agent_turn(
+        client, session, "diagnose this",
+        tools=[],
+        tool_mode=TOOL_MODE_PROMPTED_JSON,
+    )
+
+    system_sent = client.calls[0]["system"]
+    assert system_sent == SYSTEM_PROMPT
+    assert PROMPTED_PROTOCOL_HEADER[:30] not in system_sent
+
+
+def test_zero_tools_prompted_mode_no_stop_sequence(session):
+    """No stop sequences are needed when there is nothing to call."""
+    client = FakeClient([prompted({"type": "answer", "text": "All good."})])
+
+    run_agent_turn(
+        client, session, "diagnose this",
+        tools=[],
+        tool_mode=TOOL_MODE_PROMPTED_JSON,
+    )
+
+    stop_sent = client.calls[0].get("stop_sequences")
+    assert not stop_sent
