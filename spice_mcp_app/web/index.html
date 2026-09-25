@@ -55,6 +55,12 @@
     <div id="composer">
       <textarea id="input" rows="3" placeholder="Describe the symptom, or ask what is wrong…"></textarea>
       <div class="composer-side">
+        <select id="effort-mode" title="Reasoning effort for the next turn">
+          <option value="auto">Auto effort</option>
+          <option value="light">Light</option>
+          <option value="medium">Medium</option>
+          <option value="hard">Hard</option>
+        </select>
         <button id="send">Send</button>
         <button id="resim" class="ghost" title="Re-run the simulation on the selected circuit">Re-simulate</button>
       </div>

@@ -98,7 +98,15 @@ window.addEventListener("pywebviewready", async () => {
   /* The tool mode is surfaced only when it is not the default, because the fallback is
      the case where a wrong setting looks like a working app that never calls a tool. */
   const mode = started.tool_mode === "prompted_json" ? " · prompted JSON tools" : "";
-  $("model").textContent = `${started.model} · ${started.tools.length} tools${mode}`;
+  /* Two counts when they differ: the server exposes all of them, but a diagnosis turn is
+     only sent the ones it can reach, and every schema is paid for on every round. Saying
+     "7 tools" alone would be true of the server and false of the request. */
+  const offered = (started.tools_offered || []).length;
+  const count =
+    offered && offered !== started.tools.length
+      ? `${started.tools.length} tools (${offered} offered)`
+      : `${started.tools.length} tools`;
+  $("model").textContent = `${started.model} · ${count}${mode}`;
   $("session-path").textContent = started.session_path;
 
   const initial = await window.pywebview.api.get_initial_folder();
@@ -207,6 +215,9 @@ $("input").addEventListener("keydown", (event) => {
   // Enter sends; Shift+Enter is a newline.
   if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); send(); }
 });
+$("effort-mode").addEventListener("change", async (event) => {
+  await window.pywebview.api.set_effort_mode(event.target.value);
+});
 
 async function send() {
   const input = $("input");
@@ -237,7 +248,11 @@ async function send() {
   let html = "";
   if (result.tool_calls && result.tool_calls.length) html += renderToolCalls(result.tool_calls);
   html += renderMarkdown(result.text);
-  html += `<div class="muted tiny">${result.usage.input_tokens} in · ${result.usage.output_tokens} out · ${result.rounds} round${result.rounds === 1 ? "" : "s"}</div>`;
+  const offeredCount = (result.tools_offered || []).length;
+  const offeredNote = offeredCount === 0
+    ? " · zero tools (preloaded)"
+    : ` · ${offeredCount} tool${offeredCount === 1 ? "" : "s"} offered`;
+  html += `<div class="muted tiny">${result.usage.input_tokens} in · ${result.usage.output_tokens} out · ${result.rounds} round${result.rounds === 1 ? "" : "s"}${offeredNote}</div>`;
   bubble("assistant", html);
 
   updateTotals(result.totals);

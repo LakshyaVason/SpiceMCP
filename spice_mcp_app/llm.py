@@ -100,10 +100,30 @@ You have tools that read the circuit as structured text - components, nets, valu
 directives - plus a static checker and a simulator. Use them; do not ask the user to
 paste a netlist or a screenshot, and never guess at a value you could look up.
 
-An efficient order of work:
-  1. read_netlist to see the topology.
-  2. check_netlist_static for the cheap pass that catches most drafting mistakes.
-  3. run_simulation only when you need the simulator's verdict - it is slow.
+Evidence policy - read this before reaching for a tool:
+  * Verified information already in this conversation counts as read. When the user opens
+    a circuit the app runs the read tools for them and puts the real output here. That is
+    tool output, not a guess - use it.
+  * Call a tool only for something you do not already have. If what is already here
+    explains the symptom, answer from it.
+  * Never call a tool because it is the conventional next step. There is no fixed order.
+  * run_simulation is slow. It earns its cost only when the simulator's verdict is the
+    missing evidence - a fault invisible in the topology, or confirming a fix.
+  * Never state a value you have not seen. If you need one and do not have it, look it up.
+  * When the file has been written to, what was preloaded describes the old circuit. Read
+    again rather than trusting it.
+
+Answer shape:
+  * Lead with the fault. Then the specific fix. Then, briefly, why.
+  * When one clear fault explains what the user asked, that is the whole answer: two to
+    five sentences. Do not pad it.
+  * Do not calculate characteristics the user did not ask about, do not tour the
+    components, and do not add secondary observations unless they change the answer to
+    the question that was asked.
+  * Length follows the circuit, not a template. Several interacting faults, a genuinely
+    ambiguous one, or a stated spec you have to check arithmetically all earn more room -
+    and show the arithmetic when you do. Brevity is the default, not a ceiling.
+  * The user can ask for the derivation afterwards. Assume they will if they want it.
 
 Things about LTspice that matter for a correct diagnosis:
   * A simulation that "succeeds" can still be wrong. Exit codes and the presence of a
@@ -117,9 +137,9 @@ Things about LTspice that matter for a correct diagnosis:
     states an intended spec (a cutoff frequency, a gain), check the values against it
     arithmetically and show the arithmetic.
 
-When you find a fault, say plainly what is wrong, why it produces the observed
-behaviour, and what the fix is - including the specific component and value. Be
-concise and concrete. Show the numbers you relied on."""
+When you find a fault, say plainly what is wrong, what the fix is - including the
+specific component and value - and why it produces the behaviour the user asked about.
+Nothing else."""
 
 
 # --- the prompted-JSON protocol --------------------------------------------------------
@@ -149,6 +169,7 @@ Rules:
 - Never state a value you have not seen in a TOOL RESULT. If something can be looked up
   with a tool, call the tool instead of guessing.
 - Your reasoning belongs in the "text" of the final answer, not around the JSON.
+- Do not call a tool for something already stated in this conversation as tool output.
 
 TOOLS"""
 
@@ -184,6 +205,18 @@ class ToolExecutor(Protocol):
     """Runs a tool by name and returns its result as text for the model."""
 
     def __call__(self, name: str, arguments: dict[str, Any]) -> str: ...
+
+
+class ResultCompactor(Protocol):
+    """Projects a tool result down to what the model needs, or declines.
+
+    Returning `None` means "send the result unchanged", which is the safe answer and the
+    behaviour when no compactor is supplied at all. `spice_mcp_app.compact` implements
+    this; the loop is deliberately given a callable rather than importing the module, so
+    the projections stay a caller's decision and the tests can drive the loop with none.
+    """
+
+    def __call__(self, name: str, result: str) -> str | None: ...
 
 
 class LLMError(RuntimeError):
@@ -284,8 +317,15 @@ def prompted_system_prompt(tools: Iterable[dict[str, Any]] | None) -> str:
     Built per request rather than stored, because the Messages API has no system *role*:
     the system prompt is a top-level parameter on every call, so there is nowhere in the
     message history to keep it. A `{"role": "system"}` message is a 400.
+
+    When tools is empty the protocol header is omitted entirely: there is nothing to call,
+    the model should answer in plain text, and paying for the header tokens on every round
+    would be pure waste.
     """
-    return SYSTEM_PROMPT + "\n\n" + prompted_protocol_prompt(tools)
+    tool_list = list(tools or [])
+    if not tool_list:
+        return SYSTEM_PROMPT
+    return SYSTEM_PROMPT + "\n\n" + prompted_protocol_prompt(tool_list)
 
 
 def _strip_code_fence(text: str) -> str:
@@ -392,12 +432,24 @@ def prompted_tool_result_message(name: str, result: str) -> dict[str, Any]:
 
 @dataclass
 class ToolCallRecord:
-    """What happened on one tool call, for the session log and the UI."""
+    """What happened on one tool call, for the session log and the UI.
+
+    `result` is the complete tool output and is what everything except the model sees:
+    `to_dict()`, the `role="tool"` session turn, the UI's preview, and `api._pending_patch`.
+    `model_result` is the projection sent to the model when one was worth making, and is
+    deliberately *not* in `to_dict()` - see `text_for_model`.
+    """
 
     name: str
     arguments: dict[str, Any]
     result: str
     is_error: bool = False
+    model_result: str | None = None
+
+    @property
+    def text_for_model(self) -> str:
+        """What actually goes into the request. Falls back to the full result."""
+        return self.model_result if self.model_result is not None else self.result
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -432,6 +484,15 @@ class GatewayClient:
     carrying it.
     """
 
+    # Class attributes, not instance ones, so an object built with `object.__new__` - which
+    # the error-translation tests do, to avoid needing a token - still reads sane values.
+    #
+    # `_effort_supported` turns itself off the first time the gateway rejects `output_config`
+    # with a 400. The gateway is a routing layer in front of a provider and does not
+    # necessarily forward every Messages parameter; a setting nobody set must not be able to
+    # break a request, and one someone did set must not fail the turn it appears on.
+    _effort_supported = True
+
     def __init__(self, config: Config, *, timeout: float = 180.0) -> None:
         self._config = config
         token = (os.environ.get(TOKEN_ENV_VAR) or "").strip()
@@ -458,9 +519,17 @@ class GatewayClient:
         system: str = SYSTEM_PROMPT,
         max_tokens: int = MAX_TOKENS,
         stop_sequences: list[str] | None = None,
+        effort: str | None = None,
     ) -> Any:
-        """One turn. Returns the SDK's Message object."""
-        try:
+        """One turn. Returns the SDK's Message object.
+
+        `effort` is a per-request override. When given it takes precedence over
+        `self._config.effort`. Pass None to use the configured default (or no
+        output_config at all when the config is also unset).
+        """
+        effective_effort = effort if effort is not None else self._config.effort
+
+        def send() -> Any:
             return self._client.messages.create(
                 model=self._config.model,
                 max_tokens=max_tokens,
@@ -468,34 +537,131 @@ class GatewayClient:
                 messages=messages,
                 tools=tools or anthropic.NOT_GIVEN,
                 stop_sequences=stop_sequences or anthropic.NOT_GIVEN,
+                output_config=self._output_config(effective_effort),
             )
-        except anthropic.NotFoundError as exc:
+
+        try:
+            return send()
+        except anthropic.BadRequestError as exc:
+            # Must sit above the APIError branch - BadRequestError is a subclass of it.
+            if self._disable_effort_if_rejected(exc, effective_effort=effective_effort):
+                return send()  # once, and only after the parameter is off
+            raise self._as_llm_error(exc) from exc
+        except anthropic.APIError as exc:
+            raise self._as_llm_error(exc) from exc
+
+    def _output_config(self, effort: str | None = None) -> Any:
+        """`{"effort": ...}` when it is set and known to work, otherwise NOT_GIVEN.
+
+        Omitted rather than sent with a default value: `high` is already the model's own
+        default, and sending it explicitly would make an unset configuration
+        indistinguishable from a deliberate one in the gateway's logs and in ours.
+        """
+        if not effort or not self._effort_supported:
+            return anthropic.NOT_GIVEN
+        return {"effort": effort}
+
+    def _disable_effort_if_rejected(
+        self, exc: anthropic.BadRequestError, *, effective_effort: str | None = None
+    ) -> bool:
+        """Turn `output_config` off for the rest of the process if the gateway refused it.
+
+        Narrow on purpose: only a 400 that names the parameter counts, and only while it was
+        actually being sent. A blanket "retry any 400 once" would hide real request errors
+        behind a second identical failure, and the message the user needs would be the one
+        thrown away.
+        """
+        if not effective_effort or not self._effort_supported:
+            return False
+        text = str(exc).lower()
+        if "output_config" not in text and "effort" not in text:
+            return False
+        log.warning(
+            "the gateway rejected output_config={'effort': %r}; continuing without it. "
+            "Unset SPICE_MCP_EFFORT to silence this.",
+            effective_effort,
+        )
+        self._effort_supported = False
+        return True
+
+    def count_tokens(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        tools: list[dict[str, Any]] | None = None,
+        system: str = SYSTEM_PROMPT,
+        effort: str | None = None,
+    ) -> int:
+        """Input tokens for a request we do not intend to pay for.
+
+        The free way to measure a prompt, a tool catalogue or a preload change: the
+        gateway prices the input and runs no inference. That is what makes it possible to
+        attribute a token saving to the change that caused it instead of reporting one
+        lump sum at the end, without paying for a completion per iteration.
+
+        Not called from the agent loop - only from `scripts/measure_turn.py`. Measuring
+        every real turn would double the request count to learn a number `usage` already
+        reports for free.
+        """
+        effective_effort = effort if effort is not None else self._config.effort
+
+        def send() -> Any:
+            return self._client.messages.count_tokens(
+                model=self._config.model,
+                system=system,
+                messages=messages,
+                tools=tools or anthropic.NOT_GIVEN,
+                output_config=self._output_config(effective_effort),
+            )
+
+        try:
+            counted = send()
+        except anthropic.BadRequestError as exc:
+            if self._disable_effort_if_rejected(exc, effective_effort=effective_effort):
+                counted = send()
+            else:
+                raise self._as_llm_error(exc) from exc
+        except anthropic.APIError as exc:
+            raise self._as_llm_error(exc) from exc
+        return int(getattr(counted, "input_tokens", 0) or 0)
+
+    def _as_llm_error(self, exc: anthropic.APIError) -> LLMError:
+        """Translate an SDK error into one worth showing the user.
+
+        Shared by every request this class makes, so a new endpoint cannot accidentally
+        surface the SDK's own wording - which for a 404 reads like a broken URL when the
+        real cause is the gateway's routing table.
+
+        Ordered most specific first: `NotFoundError` and friends are all subclasses of
+        `APIError`, so a broad branch placed above a narrow one would swallow it.
+        """
+        if isinstance(exc, anthropic.NotFoundError):
             # A 404 from the gateway is about its routing table, not about this machine.
-            # Worth saying so: the SDK's own message reads like a broken URL.
-            raise LLMError(
+            return LLMError(
                 f"The gateway did not route {self._config.model!r}.\n\n"
                 "Either it does not offer that model id or this token is not entitled "
                 "to it. Set SPICE_MCP_MODEL in .env to an id the gateway serves.\n\n"
                 f"Endpoint: {self._config.messages_url}\n\n{exc}"
-            ) from exc
-        except (anthropic.AuthenticationError, anthropic.PermissionDeniedError) as exc:
+            )
+        if isinstance(
+            exc, (anthropic.AuthenticationError, anthropic.PermissionDeniedError)
+        ):
             # Split from the 404 on purpose - the two used to share a branch because on
             # Bedrock both meant "no model access", but here they mean different things
             # and send the reader to different places.
-            raise LLMError(
+            return LLMError(
                 f"The gateway rejected the credential "
                 f"({self._config.credentials_source}).\n\n"
                 f"Check that {TOKEN_ENV_VAR} in .env is current and entitled to "
                 f"{self._config.model}.\n\n{exc}"
-            ) from exc
-        except anthropic.APIConnectionError as exc:
-            raise LLMError(
+            )
+        if isinstance(exc, anthropic.APIConnectionError):
+            return LLMError(
                 f"Could not reach {self._config.messages_url}.\n\n"
                 "The request never got an HTTP status back, so this is a network or VPN "
                 f"problem rather than a configuration one.\n\n{exc}"
-            ) from exc
-        except anthropic.APIError as exc:
-            raise LLMError(f"The gateway call failed: {exc}") from exc
+            )
+        return LLMError(f"The gateway call failed: {exc}")
 
 
 def _block_field(block: Any, name: str) -> Any:
@@ -525,11 +691,17 @@ def _execute_tool(
     name: str,
     arguments: dict[str, Any],
     on_progress: Callable[[str], None] | None,
+    compactor: ResultCompactor | None = None,
 ) -> ToolCallRecord:
     """Run one tool through the caller's executor and record what came back.
 
     The single place either mode reaches MCP. Both loops funnel through here, so the
-    approval gate the executor implements cannot be sidestepped by picking a mode.
+    approval gate the executor implements cannot be sidestepped by picking a mode - and so
+    that the model-facing projection is applied in exactly one place too.
+
+    `compactor` returning `None` means "send the result unchanged", which is what happens
+    when it is not supplied at all. It is only ever consulted for a successful call: an
+    error result is prose rather than JSON, and it is often the actual diagnosis.
     """
     if tool_executor is None:
         return ToolCallRecord(
@@ -539,13 +711,23 @@ def _execute_tool(
     if on_progress:
         on_progress(f"{name}({', '.join(f'{k}={v!r}' for k, v in arguments.items())})")
     try:
-        return ToolCallRecord(name, arguments, tool_executor(name, arguments), False)
+        result = tool_executor(name, arguments)
     except Exception as exc:
         # Hand the failure to the model rather than aborting: a bad path or an
         # unsupported file is something it can recover from by calling the tool
         # differently.
         log.warning("tool %s failed: %s", name, exc)
         return ToolCallRecord(name, arguments, f"Tool {name} failed: {exc}", True)
+
+    model_result = compactor(name, result) if compactor is not None else None
+    if model_result is not None:
+        log.debug(
+            "compacted the %s result for the model: %d -> %d chars",
+            name,
+            len(result),
+            len(model_result),
+        )
+    return ToolCallRecord(name, arguments, result, False, model_result)
 
 
 def _usage_tokens(usage: Any) -> tuple[int, int]:
@@ -630,6 +812,8 @@ def run_agent_turn(
     history: list[dict[str, Any]] | None = None,
     on_progress: Callable[[str], None] | None = None,
     tool_mode: str = TOOL_MODE_NATIVE,
+    compactor: ResultCompactor | None = None,
+    effort: str | None = None,
 ) -> AgentResult:
     """Run one user turn to completion, executing tool calls as the model asks.
 
@@ -642,6 +826,10 @@ def run_agent_turn(
     `tool_mode` selects how tools are offered - `native` sends the `tools` parameter,
     `prompted_json` puts the catalogue in the system prompt instead. See the module
     docstring for why both exist.
+
+    `compactor`, when given, projects each tool result down to what the model needs. The
+    full result is kept on the record either way, so the session log and the UI are
+    unaffected. Omitting it sends every result in full, which is what the tests do.
     """
     if tool_mode not in TOOL_MODES:
         raise LLMError(
@@ -656,9 +844,13 @@ def run_agent_turn(
 
     if tool_mode == TOOL_MODE_PROMPTED_JSON:
         return _run_prompted_turn(
-            client, session, tools, tool_executor, history, on_progress
+            client, session, tools, tool_executor, history, on_progress, compactor,
+            effort=effort,
         )
-    return _run_native_turn(client, session, tools, tool_executor, history, on_progress)
+    return _run_native_turn(
+        client, session, tools, tool_executor, history, on_progress, compactor,
+        effort=effort,
+    )
 
 
 def _run_native_turn(
@@ -668,6 +860,9 @@ def _run_native_turn(
     tool_executor: ToolExecutor | None,
     history: list[dict[str, Any]],
     on_progress: Callable[[str], None] | None,
+    compactor: ResultCompactor | None = None,
+    *,
+    effort: str | None = None,
 ) -> AgentResult:
     """The native path: `tools` on the request, `tool_use` blocks on the reply."""
     records: list[ToolCallRecord] = []
@@ -675,7 +870,7 @@ def _run_native_turn(
     total_out = 0
 
     for round_index in range(1, MAX_TOOL_ROUNDS + 1):
-        response = client.complete(history, tools=tools)
+        response = client.complete(history, tools=tools, effort=effort)
         usage = _block_field(response, "usage")
         round_in, round_out = _usage_tokens(usage)
         total_in += round_in
@@ -711,7 +906,9 @@ def _run_native_turn(
                     True,
                 )
             else:
-                record = _execute_tool(tool_executor, name, arguments, on_progress)
+                record = _execute_tool(
+                    tool_executor, name, arguments, on_progress, compactor
+                )
 
             round_records.append(record)
             records.append(record)
@@ -719,7 +916,9 @@ def _run_native_turn(
                 {
                     "type": "tool_result",
                     "tool_use_id": _block_field(block, "id"),
-                    "content": record.result,
+                    # The projection, when there was one. `record.result` still holds the
+                    # full text for the session log and the UI.
+                    "content": record.text_for_model,
                     "is_error": record.is_error,
                 }
             )
@@ -755,6 +954,9 @@ def _run_prompted_turn(
     tool_executor: ToolExecutor | None,
     history: list[dict[str, Any]],
     on_progress: Callable[[str], None] | None,
+    compactor: ResultCompactor | None = None,
+    *,
+    effort: str | None = None,
 ) -> AgentResult:
     """The prompted path, for routes that accept `tools` and then ignore it.
 
@@ -763,9 +965,15 @@ def _run_prompted_turn(
     "the model ignored it" and "the model chose not to use it". The catalogue goes into
     the system prompt instead, which the Messages API takes as a top-level parameter on
     every call - there is no system *role* to put it in the history once.
+
+    Zero-tools path: when `tools` is an empty list, `prompted_system_prompt` returns just
+    `SYSTEM_PROMPT` (no protocol header). In that case the model should answer in plain text
+    and we return immediately without JSON parsing, stop sequences, or correction rounds.
     """
-    known = tool_names(tools)
-    system = prompted_system_prompt(tools)
+    tool_list = list(tools or [])
+    no_tools_mode = not bool(tool_list)
+    known = tool_names(tool_list)
+    system = prompted_system_prompt(tool_list)
     records: list[ToolCallRecord] = []
     total_in = 0
     total_out = 0
@@ -774,8 +982,25 @@ def _run_prompted_turn(
 
     for round_index in range(1, MAX_TOOL_ROUNDS + 1):
         response = client.complete(
-            history, system=system, stop_sequences=PROMPTED_STOP
+            history,
+            system=system,
+            stop_sequences=None if no_tools_mode else PROMPTED_STOP,
+            effort=effort,
         )
+
+        # Zero-tools fast path: no JSON to parse, return the plain text immediately.
+        if no_tools_mode:
+            usage = _block_field(response, "usage")
+            round_in, round_out = _usage_tokens(usage)
+            text = _response_text(response)
+            _log_round(session, text, usage, [])
+            return AgentResult(
+                text=text,
+                tool_calls=[],
+                rounds=round_index,
+                input_tokens=round_in,
+                output_tokens=round_out,
+            )
         usage = _block_field(response, "usage")
         truncated = _block_field(response, "stop_reason") == "max_tokens"
         round_in, round_out = _usage_tokens(usage)
@@ -858,10 +1083,12 @@ def _run_prompted_turn(
             )
 
         record = _execute_tool(
-            tool_executor, parsed["name"], parsed["arguments"], on_progress
+            tool_executor, parsed["name"], parsed["arguments"], on_progress, compactor
         )
         records.append(record)
         _log_round(session, text, usage, [record])
-        history.append(prompted_tool_result_message(record.name, record.result))
+        history.append(
+            prompted_tool_result_message(record.name, record.text_for_model)
+        )
 
     return _exhausted(records, total_in, total_out, protocol_errors)

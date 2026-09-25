@@ -1,0 +1,32 @@
+{
+  "system_prompt_old_chars": 1556,
+  "system_prompt_new_chars": 2923,
+  "system_prompt_old_tokens": 394,
+  "system_prompt_new_tokens": 736,
+  "catalogue_7_names": [
+    "read_netlist",
+    "check_netlist_static",
+    "run_simulation",
+    "read_sim_log",
+    "patch_component_value",
+    "diff_netlist",
+    "export_netlist"
+  ],
+  "catalogue_5_names": [
+    "read_netlist",
+    "check_netlist_static",
+    "run_simulation",
+    "read_sim_log",
+    "patch_component_value"
+  ],
+  "prompted_system_7_tools_tokens": 2689,
+  "prompted_system_5_tools_tokens": 2346,
+  "prompted_system_7_tools_chars": 10733,
+  "prompted_system_5_tools_chars": 9363,
+  "run_simulation_full_chars": 2304,
+  "run_simulation_model_chars": 1070,
+  "run_simulation_full_tokens": 581,
+  "run_simulation_model_tokens": 273,
+  "topology_block_chars": 196,
+  "topology_block_tokens": 54
+}

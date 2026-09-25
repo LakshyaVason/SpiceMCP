@@ -57,6 +57,9 @@ _LLM_ONLY_ENV = frozenset(
         "SPICE_MCP_MODEL",
         "SPICE_MCP_BASE_URL",
         "SPICE_MCP_TOOL_MODE",
+        # How much the model thinks before answering is no more the server's business than
+        # how it is asked to call tools. A netlist parser has no use for either.
+        "SPICE_MCP_EFFORT",
     }
 )
 _LLM_ONLY_PREFIXES = ("AWS_",)

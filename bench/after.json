@@ -1,0 +1,26 @@
+{
+  "label": "after",
+  "circuit": "RCLP.asc",
+  "model": "us.anthropic.claude-opus-5",
+  "tool_mode": "prompted_json",
+  "count_only": false,
+  "session_log": "C:\\Users\\Expertician\\ClaudeCodeTest\\SpiceMCP\\sessions\\0c78de4f-89fa-4fcd-81b6-090425a98e07.json",
+  "rows": [
+    {
+      "question": "why is my circuit not getting any gain",
+      "ok": true,
+      "rounds": 1,
+      "tool_calls": [],
+      "tool_call_count": 0,
+      "tool_result_chars": [],
+      "input_tokens": 3726,
+      "output_tokens": 359,
+      "total_tokens": 4085,
+      "answer_words": 105,
+      "answer_chars": 562,
+      "correct": true,
+      "missing": [],
+      "answer": "The signal path is broken: R1's left pin isn't wired to anything (LTspice named it NC_01) and V1's Vin node has only that one connection. So the source is completely disconnected from the RC network - Vout sits at 0 for all frequencies, i.e. no output at all.\n\nFix: wire the dangling pin of R1 to the Vin node (V1's + terminal). Then you get the intended divider/low-pass: R1 in series, C1 and R2 to ground.\n\nNote once it's connected, R2 (15k to ground) will hold the passband gain to 15k/(10k+15k) = 0.6, not unity - remove it if you wanted a plain RC low-pass."
+    }
+  ]
+}

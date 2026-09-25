@@ -21,7 +21,10 @@ from typing import Any
 
 from spice_mcp_server.ltspice import ltspice_is_running
 
+from .cache import TopologyCache
+from .compact import circuit_summary, compact_tool_result
 from .config import Config, ConfigError, load_config
+from .effort import PreloadState, UI_MODE_MAP, classify_effort
 from .llm import (
     AgentResult,
     GatewayClient,
@@ -32,6 +35,7 @@ from .llm import (
 )
 from .mcp_client import MCPClientError, SpiceMCP, find_circuits
 from .session import Session, Turn
+from .tool_policy import select_tools
 
 log = logging.getLogger(__name__)
 
@@ -71,6 +75,10 @@ class Api:
         self._history: list[dict[str, Any]] = []
         self._approved: set[tuple[str, str, str]] = set()
         self._lock = threading.Lock()  # one agent turn at a time
+        # Adaptive context state — reset each time a circuit is selected.
+        self._preload_state: PreloadState | None = None
+        self._effort_ui_mode: str = "auto"
+        self._topology_cache: TopologyCache = TopologyCache()
         # The leading underscore is load-bearing, not style. pywebview builds the JS bridge
         # by recursively walking every *public* attribute of this object
         # (webview/util.py:180-211) and it skips names starting with "_". Public, this held a
@@ -146,6 +154,10 @@ class Api:
             model=self._config.model,
             tool_mode=self._config.tool_mode,
             tools=[t["name"] for t in self._tools],
+            # What a diagnosis turn actually offers the model. Reported separately so the
+            # header can say "7 tools (5 offered)" rather than a number that is true of the
+            # server and false of the request - the difference is exactly what this saves.
+            tools_offered=[t["name"] for t in self._model_tools("")],
             session_id=self._session.session_id,
             session_path=str(self._session.path),
             config=self._config.redacted(),
@@ -198,6 +210,9 @@ class Api:
         if not target.is_file():
             return _err(f"No such file: {target}")
 
+        # Reset preload state before any new circuit loads.
+        self._preload_state = None
+
         self._session.set_circuit_file(str(target))
         try:
             raw = self._mcp.call_tool("check_netlist_static", {"path": str(target)})
@@ -209,7 +224,16 @@ class Api:
         except json.JSONDecodeError:
             checks = {"summary": raw, "findings": [], "ok": False}
 
-        note = self._selection_note(target, checks)
+        topology = self._preload_topology(target)
+
+        # Record what was successfully loaded so tool_policy and classify_effort can use it.
+        self._preload_state = PreloadState(
+            topology_ok=topology is not None,
+            static_ok=isinstance(checks, dict) and "findings" in checks,
+            static_finding_count=len((checks or {}).get("findings") or []),
+        )
+
+        note = self._selection_note(target, checks, topology=topology)
         # Folded into the pending user turn rather than appended as its own: the Messages
         # API rejects two user turns in a row, and the next question adds one.
         append_user_note(self._history, note)
@@ -222,11 +246,59 @@ class Api:
             warning=self._ltspice_open_warning(target),
         )
 
+    def _preload_topology(self, target: Path) -> str | None:
+        """The circuit summary for the selection note, or `None` if it could not be read.
+
+        The redundant `read_netlist` round in the baseline was not the model being
+        wasteful: the static *findings* were preloaded but the topology was not, so it
+        genuinely did not have the components it needed to name a fix. Telling it not to
+        call the tool without first supplying the data would have made it answer from
+        information it did not have.
+
+        Failure here is not an error for the caller. An ExpressPCB `.net`, a missing
+        LTspice, an unparseable file - the selection still succeeds, the summary is simply
+        absent, and `_selection_note` then does not claim the topology is loaded. That
+        pairing is the safety property: the model is never told it has data it does not.
+
+        `include_raw_text=False` because the projection drops `raw_text` anyway, so
+        carrying it over the MCP pipe would be pure overhead.
+
+        The topology cache avoids re-running the LTspice subprocess when the same circuit
+        is re-selected without changes. Cache reduces *latency* only — the topology string
+        ends up in conversation history and is billed on every subsequent request regardless.
+        """
+        if self._mcp is None:
+            return None
+
+        path_str = str(target)
+        cached = self._topology_cache.get(path_str)
+        if cached is not None:
+            log.debug("topology cache hit for %s", target)
+            return cached
+
+        try:
+            raw = self._mcp.call_tool(
+                "read_netlist", {"path": path_str, "include_raw_text": False}
+            )
+            payload = json.loads(raw)
+        except (MCPClientError, json.JSONDecodeError) as exc:
+            log.info("no topology preload for %s: %s", target, exc)
+            return None
+        if not isinstance(payload, dict):
+            return None
+
+        summary = circuit_summary(payload)
+        if summary is not None:
+            self._topology_cache.put(path_str, summary)
+        return summary
+
     @staticmethod
-    def _selection_note(target: Path, checks: dict[str, Any]) -> str:
+    def _selection_note(
+        target: Path, checks: dict[str, Any], *, topology: str | None = None
+    ) -> str:
         """The context injected when a circuit is selected.
 
-        Two jobs. First, the absolute path: the tools take a path argument rather than
+        Three jobs. First, the absolute path: the tools take a path argument rather than
         having an implicit "current circuit", and without being told, the model guesses a
         relative name the server then cannot find.
 
@@ -235,15 +307,32 @@ class Api:
         worst of both worlds - it told the model something was wrong without saying what,
         which is an invitation to re-run the same check to find out. Handing over the
         findings both saves that round trip and gives the model something to reason from.
+
+        Third, the topology, by the same argument one step further: the findings say *what*
+        is wrong, and the components say what to do about it. With both here a simple fault
+        needs no tool call at all.
+
+        **The list of what has already run is derived from what actually succeeded**, never
+        written as a fixed string. If the topology could not be read, the note says so and
+        points at `read_netlist`. A model told it has data it does not have would answer
+        from nothing, which is a worse failure than any number of redundant tool calls.
         """
         findings = checks.get("findings") or []
+        already_ran = ["check_netlist_static"] + (["read_netlist"] if topology else [])
         lines = [
             f"[The user has opened this circuit: {target}",
             "Use that exact absolute path in tool calls.",
-            "check_netlist_static has already run on it - the findings are below, so do "
-            "not run it again unless the file changes.",
-            f"static check: {checks.get('summary', 'n/a')}",
+            "Already run for you, with the real output below - this is tool output, not a "
+            "guess, so do not call these again unless the file changes: "
+            + ", ".join(already_ran)
+            + ".",
         ]
+        if not topology:
+            lines.append(
+                "The topology was NOT read - call read_netlist when you need components, "
+                "nodes or values."
+            )
+        lines.append(f"static check: {checks.get('summary', 'n/a')}")
         for finding in findings[:MAX_PRELOADED_FINDINGS]:
             if not isinstance(finding, dict):
                 continue
@@ -262,6 +351,8 @@ class Api:
                 f"- ...and {len(findings) - MAX_PRELOADED_FINDINGS} more; "
                 f"re-run check_netlist_static to see them all."
             )
+        if topology:
+            lines.append(topology)
         return "\n".join(lines) + "]"
 
     def _ltspice_open_warning(self, target: Path) -> str | None:
@@ -320,12 +411,49 @@ class Api:
 
         return self._mcp.call_tool(name, arguments)
 
+    def _model_tools(self, text: str) -> list[dict[str, Any]]:
+        """The catalogue for this turn, selected by intent and preload state.
+
+        `self._tools` stays the full set - `start()` reports it, and the server's seven are
+        pinned by `tests/test_write_conflict.py`. This is only about what each *request*
+        pays for.
+
+        Delegates to `tool_policy.select_tools`, which uses `_preload_state` to determine
+        which tools are actually needed. Zero tools means "answer from what you already have".
+        """
+        if not self._tools:
+            return self._tools
+        return select_tools(self._tools, text, self._preload_state)
+
+    def set_effort_mode(self, mode: str) -> dict[str, Any]:
+        """Set the reasoning-effort mode for subsequent turns.
+
+        Accepts "auto" | "light" | "medium" | "hard". Does NOT modify the session log
+        schema — effort is logged via logging.info() only so the frozen schema is not
+        disturbed.
+        """
+        valid = {"auto", "light", "medium", "hard"}
+        if mode not in valid:
+            return _err(f"Unknown effort mode {mode!r}. Use one of: {', '.join(sorted(valid))}.")
+        self._effort_ui_mode = mode
+        log.info("effort UI mode set to %r", mode)
+        return _ok(effort_mode=mode)
+
     def send_message(self, text: str) -> dict[str, Any]:
         """Run one user turn to completion and return the assistant's answer."""
         if self._session is None or self._client is None:
             return _err("The session is not started.")
         if not text or not text.strip():
             return _err("Type a message first.")
+
+        # Resolve effort before acquiring the lock — classify_effort is pure/fast.
+        if self._effort_ui_mode == "auto":
+            effort = classify_effort(text, self._preload_state)
+        else:
+            effort = UI_MODE_MAP.get(self._effort_ui_mode)
+        log.info("effort: ui_mode=%r → %r", self._effort_ui_mode, effort)
+
+        tools = self._model_tools(text)
 
         if not self._lock.acquire(blocking=False):
             return _err("A turn is already running.")
@@ -335,11 +463,16 @@ class Api:
                 self._client,
                 self._session,
                 text.strip(),
-                tools=self._tools,
+                tools=tools,
                 tool_executor=self._tool_executor,
                 history=self._history,
                 on_progress=progress.append,
                 tool_mode=self._config.tool_mode,
+                # Compact for the model, complete for the record: the projection is what
+                # goes into the request, `record.result` below is still the full text the
+                # session log, the UI preview and `_pending_patch` read.
+                compactor=compact_tool_result,
+                effort=effort,
             )
         except LLMError as exc:
             return _err(str(exc))
@@ -356,6 +489,7 @@ class Api:
             },
             totals=self.totals()["totals"],
             pending_patch=self._pending_patch(result),
+            tools_offered=[t["name"] for t in tools],
         )
 
     def _present_tool_call(self, record: Any) -> dict[str, Any]:
@@ -427,11 +561,21 @@ class Api:
         if not payload.get("applied"):
             return _err(payload.get("summary", raw))
 
+        # Invalidate the topology cache and preload state: the file has been rewritten, so
+        # any cached summary is stale and the next tool-policy decision must start fresh.
+        self._topology_cache.invalidate(str(resolved.resolve()))
+        self._preload_state = None
+
         # Tell the model what the user did, so the conversation stays truthful about
         # the state of the file and it can verify against the real schematic.
         note = (
             f"[The user approved your fix. {ref} is now {new_value} in "
-            f"{resolved.name}; the file has been written.]"
+            f"{resolved.name}; the file has been written.\n"
+            # The file has changed, so the preloaded static check and topology above are now
+            # out of date. Without this, the policy telling the model not to re-run what has
+            # already run would suppress exactly the verification that matters most.
+            "The file has changed, so the preloaded static check and topology above are now "
+            "stale - re-read what you need to verify the fix.]"
         )
         append_user_note(self._history, note)
         self._session.add_turn(Turn(role="user", text=note))

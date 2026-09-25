@@ -20,7 +20,8 @@ the LTspice GUI, the sim is re-run to confirm, and every turn's token usage is l
    `TAMU_API_KEY`, and `Config` deliberately does not hold it: `GatewayClient.__init__`
    reads it from the environment at the moment it builds the SDK client and keeps it only
    inside the `Anthropic` instance. `Config` carries `model`, `base_url`, a
-   `credentials_source` **label**, `sessions_dir` and `tool_mode`, and nothing else — so
+   `credentials_source` **label**, `sessions_dir`, `tool_mode` and `effort`, and nothing
+   else — so
    there is nothing for a stray debug print or a `repr()` in a traceback to leak, by
    construction rather than by filtering. The label is `TAMU_API_KEY (<n> chars)`: enough to
    distinguish "set" from "truncated paste", and deliberately **not** a last-four
@@ -227,8 +228,8 @@ the config value.
 - **`prompted_system_prompt` is rebuilt per request** because there is nowhere in the history
   to keep it. `tests/test_llm.py` asserts the protocol text is present on *every* call and
   that no `{"role": "system"}` message is ever appended.
-- `SPICE_MCP_TOOL_MODE` is in `mcp_client._LLM_ONLY_ENV`: how the model is asked to call tools
-  is not the server's business.
+- `SPICE_MCP_TOOL_MODE` is in `mcp_client._LLM_ONLY_ENV`, and so is `SPICE_MCP_EFFORT`: how
+  the model is asked to call tools, and how hard it thinks, are not the server's business.
 - `scripts\probe_tool_calling.py --prompted-json` probes the fallback using the app's real
   prompt builder, stop sequence and parser, so a pass is evidence about shipping code. **The
   native probe's meaning is fixed** — it passes only on a real `tool_use` block, and is not to
@@ -282,19 +283,102 @@ into. Names starting with `_` are skipped, and objects can opt out with
   if `pywebviewready` never arrives. It only helps when the bridge alone is broken — a walk
   that blocks the UI thread outright leaves nothing able to paint.
 
+## The conciseness / token experiment — branch `experiment/concise-token-optimization`
+
+**Branch-local. Not merged.** `main` at `f98099a` still reproduces the demonstrated
+behaviour exactly; that was the point of branching.
+
+The professor's objection was that a trivial fault produced a lecture. Measured on the same
+circuit and the same question (`RCLP.asc`, *"why is my circuit not getting any gain"*,
+`prompted_json`), before and after:
+
+| | rounds | tool calls | in | out | total | words | correct |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| before | 2 | 1 (`read_netlist`) | 8530 | 1354 | 9884 | 356 | yes |
+| after | 1 | 0 | 3726 | 359 | **4085** | 105 | yes |
+
+**−58.7% total, −73.5% output.** `bench/*.json` holds the raw rows and the session logs
+they came from; `bench/attribution.json` holds the per-change breakdown.
+
+**Where the saving actually came from, and where it did not.** Round 1 got 124 tokens
+*bigger*, not smaller. The prompt rewrite cost +342 tokens and the catalogue trim gave back
+−343, so those cancel almost exactly; the net rise is the preloaded topology block (54
+tokens) plus the note describing it. **The entire win is the second round no longer
+happening** — 4928 in and 1238 out. Any future work here should be judged on rounds first
+and bytes second.
+
+- **The preload is what makes the prompt policy honest.** `select_circuit` now runs
+  `read_netlist` as well as `check_netlist_static` and folds a projection into the note, so
+  "answer from what you already have" refers to information that is genuinely present.
+  Telling the model not to call `read_netlist` *without* preloading it would have been an
+  instruction to guess. The note's claim is derived from what actually succeeded — a failed
+  preload says "The topology was NOT read", because the one unacceptable outcome is the
+  model being told it has something it does not.
+- **`spice_mcp_app/compact.py` is the model-facing projection**, never the record.
+  `ToolCallRecord.result` still holds the full MCP JSON, so the session log, the UI's
+  preview and `_pending_patch` are unchanged. Measured on the real `run_simulation` result:
+  581 → 273 tokens. `circuit_summary` **fails closed** (returns `None` on a payload that is
+  not a netlist) while `compact_tool_result` **fails open** (sends the original when it does
+  not recognise the shape) — the asymmetry is deliberate, and each direction is the safe one
+  for its caller.
+- **The catalogue trim withholds only `diff_netlist` and `export_netlist`.**
+  `patch_component_value` is never withheld: with no model call there is no `pending_patch`,
+  no diff panel and no Apply button, so the entire approval flow would die. `Api._tools`
+  stays all seven, so `start()` and `app_smoke.py` stage 1 are untouched; the keyword rule
+  in `_model_tools` can only ever *widen* the catalogue.
+- **A consequence worth knowing: the session log now over-states what the model saw.** The
+  token counts stay honest — they come from `usage` — but a human reconstructing the request
+  from the log's `role="tool"` turns would be reading the full payload where the model got
+  the projection.
+
+### Verified live, 2026-09-13 — and one thing that is not a lever
+
+- **`temperature` is not the answer, twice over.** It is not a parameter of
+  `messages.create` in anthropic 1.3.0 at all, and forcing it through `extra_body` is
+  rejected with a 400 by Opus 5. It also controls sampling variability rather than length.
+  `tests/test_config.py::test_temperature_is_not_a_setting_anywhere` records this so it is
+  not rediscovered.
+- **`output_config={"effort": …}` is the real knob, and the gateway does forward it** —
+  probed live: accepted, and 37 vs 48 output tokens on a small arithmetic prompt. It matters
+  because **`usage.output_tokens` includes adaptive thinking tokens** (roughly 770 of the
+  baseline turn's ~1350), so prompt wording can only ever reach about 40% of the output cost.
+  `SPICE_MCP_EFFORT` is **unset by default**, which omits the parameter entirely; a gateway
+  that rejected it would get one warning and a retry without it, not a failed turn. It has
+  **not** been measured on a real diagnosis — do not quote a saving for it.
+- **Prompt caching stays off, deliberately.** It would cut billed input tokens, but
+  `session.py`'s schema is frozen by the external comparison and drops
+  `cache_read_input_tokens`/`cache_creation_input_tokens`, so the log would under-report real
+  cost — corrupting the exact number this project exists to produce.
+- **The `.env` comment claiming Opus 5 "ignores tools" is stale** and was left alone on
+  purpose: transport is not this experiment's business. `native` is verified working on
+  `/v1/messages`; `prompted_json` is what the demo used, so it is what the bench used.
+
+### Guard runs — a cheap answer to the easy case proves nothing
+
+- `bench/after-hard.json` — `wrong_value_lowpass.asc`, a 10× capacitor error invisible to
+  both the static checks and the simulator. Correct, **with the arithmetic shown**, in 42
+  words. Brevity did not cost the reasoning.
+- `bench/after-needs-tool.json` — `source_conflict.asc`, asked for the simulator's verdict.
+  The agent still called `run_simulation` and quoted the real log line. **The agent is not
+  lazier, it is better informed** — the tool calls that disappeared were the redundant ones.
+
 ## Commands
 
 ```bat
 .venv\Scripts\activate
-python -m pytest                        REM 288 tests, ~42s
+python -m pytest                        REM 337 tests, ~43s
 python -m spice_mcp_app                 REM the desktop app; --folder fixtures --debug
 python -m spice_mcp_app --file fixtures\wrong_value_lowpass.asc   REM one circuit, pre-checked
 python -m spice_mcp_app.launch fixtures\wrong_value_lowpass.asc --no-ltspice
 python -m spice_mcp_server              REM stdio server; sits waiting for a client
 python scripts\install_context_menu.py  REM right-click verb; --status / --uninstall
 python scripts\probe_tool_calling.py    REM 3-stage gateway check; --prompted-json for the
-                                        REM other tool mode. Costs a few tokens.
+                                        REM other tool mode, --effort low for output_config.
+                                        REM Costs a few tokens.
 python scripts\app_smoke.py             REM headless end-to-end, no window; costs money
+python scripts\measure_turn.py --circuit RCLP.asc --question "..." --label after
+                                        REM one turn's rounds/tools/tokens/words; costs money.
+                                        REM --count-only prices the request for free.
 ```
 
 `scripts\list_bedrock_models.py` is a **leftover from the direct-Bedrock detour** and cannot
@@ -309,7 +393,7 @@ and `°`, which crash a cp1252 console.
 
 `.mcp.json` registers the server so it can be driven from Claude Code directly.
 
-## State: Steps 0–8, the Explorer launcher, and the gateway migration; 288 tests pass
+## State: Steps 0–8, the Explorer launcher, and the gateway migration; 337 tests pass
 
 **Server half — `spice_mcp_server/`, seven tools**, all verified over a real MCP stdio
 handshake. It still knows nothing about LLMs.
@@ -466,7 +550,7 @@ part that genuinely needs eyes.
 5. In LTspice: **File ▸ Revert** → `C1` shows the new value in the GUI. ← closes the GUI item.
 6. `python scripts\install_context_menu.py --uninstall` — the entry is gone.
 
-Automated up to that point: 288 tests, plus a headless launcher run verified to reach window
+Automated up to that point: 337 tests, plus a headless launcher run verified to reach window
 creation with `get_initial_folder()` returning the resolved folder and circuit, cwd back at
 the repo root, and nothing written beside the fixture.
 

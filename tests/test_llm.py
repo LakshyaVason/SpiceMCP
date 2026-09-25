@@ -35,10 +35,12 @@ import anthropic
 import httpx2
 import pytest
 
-from spice_mcp_app.api import Api
+from spice_mcp_app.api import PATCH_TOOL, Api
+from spice_mcp_app.compact import compact_tool_result
 from spice_mcp_app.config import TOOL_MODE_NATIVE, TOOL_MODE_PROMPTED_JSON
 from spice_mcp_app.llm import (
     MAX_PROTOCOL_CORRECTIONS,
+    MAX_TOKENS,
     MAX_TOOL_ROUNDS,
     SYSTEM_PROMPT,
     GatewayClient,
@@ -50,6 +52,7 @@ from spice_mcp_app.llm import (
     prompted_protocol_prompt,
     run_agent_turn,
 )
+from spice_mcp_app.mcp_client import MCPClientError
 from spice_mcp_app.session import Session
 
 
@@ -113,6 +116,7 @@ class FakeClient:
         system=SYSTEM_PROMPT,
         max_tokens=None,
         stop_sequences=None,
+        effort=None,
     ):
         self.calls.append(
             {
@@ -120,6 +124,7 @@ class FakeClient:
                 "tools": tools,
                 "system": system,
                 "stop_sequences": stop_sequences,
+                "effort": effort,
             }
         )
         if not self._responses:
@@ -219,6 +224,67 @@ def test_translation_substitutes_an_empty_schema():
 
 def test_translation_skips_nameless_tools():
     assert mcp_tools_to_anthropic([{"description": "no name"}]) == []
+
+
+# --- the response policy in the system prompt -------------------------------------------
+#
+# The prompt is the only lever on verbosity that exists here: `temperature` was removed from
+# Claude Opus 5 and is a 400 on this gateway, and a small `max_tokens` would truncate a
+# legitimate answer rather than shorten it. So these assertions are on prompt *text* - weak
+# evidence about the model, but the strongest available offline, and enough to fail loudly if
+# a future edit puts the lecture back.
+
+
+def test_the_prompt_asks_for_fault_then_fix_then_reason():
+    ordering = SYSTEM_PROMPT.index("Lead with the fault. Then the specific fix.")
+    assert ordering > 0
+    assert "two to\n    five sentences" in SYSTEM_PROMPT
+
+
+def test_the_prompt_rules_out_the_three_digressions_from_the_baseline():
+    """The baseline answer added divider gain, a cutoff derivation and an aside about
+    `AC 0.7 3000`, to a question that asked about none of them."""
+    assert "do not tour the" in SYSTEM_PROMPT
+    assert "characteristics the user did not ask about" in SYSTEM_PROMPT
+    assert "secondary observations unless they change the answer" in SYSTEM_PROMPT
+    # And the instruction that invited the arithmetic in the first place is gone.
+    assert "Show the numbers you relied on" not in SYSTEM_PROMPT
+
+
+def test_brevity_is_a_default_and_not_a_ceiling():
+    """A hard cap would be the wrong fix: a genuinely hard circuit has to be allowed room,
+    and a stated spec still has to be checked arithmetically and shown."""
+    assert "Brevity is the default, not a ceiling." in SYSTEM_PROMPT
+    assert "show the arithmetic when you do" in SYSTEM_PROMPT
+    assert MAX_TOKENS == 16000
+
+
+def test_the_generic_tool_ordering_is_gone():
+    """`read_netlist -> check_netlist_static -> run_simulation` as a numbered sequence is
+    what produced the redundant round: the model followed the list rather than asking what
+    it was missing."""
+    assert "An efficient order of work" not in SYSTEM_PROMPT
+    assert "1. read_netlist" not in SYSTEM_PROMPT
+    assert "There is no fixed order." in SYSTEM_PROMPT
+    assert "Verified information already in this conversation counts as read." in SYSTEM_PROMPT
+    assert "Call a tool only for something you do not already have." in SYSTEM_PROMPT
+
+
+def test_the_ltspice_correctness_facts_survive_the_rewrite():
+    """These are why the answers are right, and they are cheap. Cutting them to save tokens
+    would be trading correctness for the metric."""
+    assert "M means milli, not mega" in SYSTEM_PROMPT
+    assert 'A simulation that "succeeds" can still be wrong.' in SYSTEM_PROMPT
+    assert "Neither subsumes the" in SYSTEM_PROMPT
+    assert "can still have a wrong value" in SYSTEM_PROMPT
+
+
+def test_the_prompted_protocol_carries_the_same_evidence_rule():
+    """Prompted mode gets its own copy of the header, so a rule added only to the shared
+    prompt would still apply - but the protocol rules are what that mode's model reads most
+    closely, and the redundant call is a protocol-shaped mistake there."""
+    protocol = prompted_protocol_prompt([])
+    assert "already stated in this conversation as tool output" in protocol
 
 
 # --- the loop -------------------------------------------------------------------------
@@ -1128,6 +1194,143 @@ def test_llm_error_is_the_type_the_ui_catches():
     assert issubclass(LLMError, RuntimeError)
 
 
+# --- the effort knob ------------------------------------------------------------------
+#
+# The only lever on thinking tokens that exists on this model, and thinking is most of the
+# output cost - roughly 770 of the baseline turn's ~1350. `temperature` is not an
+# alternative: it is absent from `messages.create` in anthropic 1.3.0 and 400s through
+# `extra_body` on Opus 5.
+#
+# Since the gateway is a routing layer that need not forward every Messages parameter, the
+# tests below are as much about the failure mode as the feature.
+
+
+def _recording_client(fake_config, *, effort=None, reject_with=None):
+    """A GatewayClient that records request kwargs instead of sending them.
+
+    Offline for the same reason as `_gateway_client_raising`: `object.__new__` skips the
+    constructor, which would want a token.
+
+    `reject_with` raises that exception on the *first* call only, so a test can tell a
+    retry from a re-raise by what the recorder ends up holding.
+    """
+    client = object.__new__(GatewayClient)
+    client._config = replace(fake_config, effort=effort)
+    calls: list[dict] = []
+
+    class Recorder:
+        class messages:
+            @staticmethod
+            def create(**kwargs):
+                calls.append(kwargs)
+                if reject_with is not None and len(calls) == 1:
+                    raise reject_with
+                return answer("ok")
+
+            @staticmethod
+            def count_tokens(**kwargs):
+                calls.append(kwargs)
+                if reject_with is not None and len(calls) == 1:
+                    raise reject_with
+                return Usage(input_tokens=42)
+
+    client._client = Recorder()
+    return client, calls
+
+
+def _bad_request(message):
+    return anthropic.BadRequestError(message, response=_response(400), body=None)
+
+
+def test_an_unset_effort_omits_the_parameter_entirely(fake_config):
+    """The default path has to be byte-identical to what it was before this setting existed.
+
+    Sending `high` explicitly would be equivalent for the model and wrong for us: it would
+    make "nobody configured this" indistinguishable from "somebody chose high".
+    """
+    client, calls = _recording_client(fake_config, effort=None)
+    client.complete([{"role": "user", "content": "hi"}])
+
+    assert calls[0]["output_config"] is anthropic.NOT_GIVEN
+
+
+def test_a_set_effort_travels_on_the_request(fake_config):
+    client, calls = _recording_client(fake_config, effort="low")
+    client.complete([{"role": "user", "content": "hi"}])
+
+    assert calls[0]["output_config"] == {"effort": "low"}
+    # Never these, on any code path. `thinking` in particular: passing it at all has been
+    # seen to make the model narrate a tool call in visible text instead of emitting a
+    # `tool_use` block, and `budget_tokens` is a 400 on Opus 5.
+    assert "thinking" not in calls[0]
+    assert "temperature" not in calls[0]
+
+
+def test_the_count_tokens_probe_carries_the_same_effort(fake_config):
+    """Otherwise `measure_turn.py --count-only` would price a request nobody sends."""
+    client, calls = _recording_client(fake_config, effort="medium")
+
+    assert client.count_tokens([{"role": "user", "content": "hi"}]) == 42
+    assert calls[0]["output_config"] == {"effort": "medium"}
+
+
+def test_a_gateway_that_rejects_output_config_retries_once_without_it(fake_config):
+    """A gateway that does not forward the parameter must not break the turn it appears on.
+
+    The recovery is checked through what the *second* request carried, not through the
+    return value: a retry that resent the rejected parameter would loop or fail identically.
+    """
+    client, calls = _recording_client(
+        fake_config,
+        effort="low",
+        reject_with=_bad_request("output_config: unsupported parameter"),
+    )
+
+    client.complete([{"role": "user", "content": "hi"}])
+
+    assert len(calls) == 2, "expected exactly one retry"
+    assert calls[0]["output_config"] == {"effort": "low"}
+    assert calls[1]["output_config"] is anthropic.NOT_GIVEN
+    # Off for the rest of the process, so the cost is one 400 per run and not one per turn.
+    assert client._output_config() is anthropic.NOT_GIVEN
+    # An instance attribute, so one client's discovery cannot silently disable the parameter
+    # for every future client in the process - including a differently-configured one.
+    assert GatewayClient._effort_supported is True
+
+
+def test_a_400_about_something_else_is_not_retried_and_not_swallowed(fake_config):
+    """The narrowness is the point.
+
+    "Retry any 400 once" would hide a real request error behind a second identical failure,
+    and the message the user needs would be the one thrown away.
+    """
+    client, calls = _recording_client(
+        fake_config, effort="low", reject_with=_bad_request("max_tokens is required")
+    )
+
+    with pytest.raises(LLMError) as caught:
+        client.complete([{"role": "user", "content": "hi"}])
+
+    assert "max_tokens" in str(caught.value)
+    assert len(calls) == 1, "a 400 unrelated to the parameter must not be retried"
+
+
+def test_no_retry_when_the_parameter_was_never_being_sent(fake_config):
+    """With effort unset there is nothing to disable, so a 400 mentioning it is a real error.
+
+    Without this guard the retry would be reachable on the default path, where it can only
+    ever duplicate a failed request.
+    """
+    client, calls = _recording_client(
+        fake_config, effort=None, reject_with=_bad_request("effort is weird")
+    )
+
+    with pytest.raises(LLMError):
+        client.complete([{"role": "user", "content": "hi"}])
+
+    assert len(calls) == 1
+
+
 # --- the approval gate ----------------------------------------------------------------
 
 
@@ -1245,6 +1448,223 @@ def test_no_tool_mode_can_write_without_approval(api, tmp_path, mode):
     assert out["text"] == "Understood, I will show you the diff."
 
 
+# --- the model-facing catalogue ---------------------------------------------------------
+#
+# Tool selection is now driven by tool_policy.select_tools, which uses PreloadState to
+# decide the minimal needed set. Zero tools is valid when preload is complete and no
+# action intent is detected. The invariants tested here:
+#   - With no preload state, recovery tools are always exposed.
+#   - Widen keywords still return all 7.
+#   - The full set `self._tools` is never reduced; `start()` reports all 7.
+
+SEVEN_TOOLS = mcp_tools_to_anthropic(
+    [
+        FakeTool(name, f"Does {name}.", {"type": "object", "properties": {}})
+        for name in (
+            "read_netlist",
+            "check_netlist_static",
+            "run_simulation",
+            "read_sim_log",
+            "patch_component_value",
+            "diff_netlist",
+            "export_netlist",
+        )
+    ]
+)
+
+
+def test_asking_about_a_diff_or_an_export_widens_the_catalogue(api):
+    """The trigger can only widen. A rule that withholds on a guess would block a
+    legitimate workflow; one that offers too much merely costs the tokens it was saving."""
+    api._tools = SEVEN_TOOLS
+    for text in (
+        "diff the two netlists for me",
+        "compare it against the backup",
+        "export this to a .net file",
+        "show me before and after",
+    ):
+        assert len(api._model_tools(text)) == 7, text
+
+
+def test_the_request_carries_the_trimmed_catalogue(api, tmp_path):
+    """With no preload state (no circuit selected), recovery tools are offered."""
+    api._tools = SEVEN_TOOLS
+    api._client = FakeClient([answer("No gain because R1's pin is on NC_01.")])
+
+    out = api.send_message("why is my circuit not getting any gain")
+
+    assert out["ok"], out.get("error")
+    sent = [t["name"] for t in api._client.calls[0]["tools"]]
+    # No preload → recovery tools only (read_netlist + check_netlist_static)
+    assert "diff_netlist" not in sent and "export_netlist" not in sent
+    assert "read_netlist" in sent
+    assert "check_netlist_static" in sent
+
+
+# --- compact for the model, complete for the record -------------------------------------
+#
+# The projections themselves are tested in test_compact.py. What matters here is the split:
+# the request carries the projection, and everything that is a *record* - the session log,
+# `to_dict()` for the UI, `_pending_patch` - still carries the full tool output. Getting
+# that backwards would either cost the tokens anyway or quietly gut the session log the
+# external cost comparison depends on.
+
+
+def full_netlist_json():
+    from tests.test_compact import RCLP_NETLIST
+
+    return json.dumps(RCLP_NETLIST, indent=2)
+
+
+def test_the_model_sees_the_projection_while_the_record_keeps_the_full_result(session):
+    client = FakeClient(
+        [
+            wants_tools("Reading it.", [("read_netlist", {"path": "c.asc"})]),
+            answer("R1's left pin is on NC_01, so Vin never reaches the filter."),
+        ]
+    )
+    full = full_netlist_json()
+    history: list[dict] = []
+
+    result = run_agent_turn(
+        client,
+        session,
+        "why is there no gain",
+        tools=[{"name": "read_netlist", "description": "", "input_schema": {}}],
+        tool_executor=lambda name, arguments: full,
+        history=history,
+        compactor=compact_tool_result,
+    )
+
+    sent = tool_results(history[2])[0]["content"]
+    assert "R1 Vout NC_01 10k" in sent
+    assert "spice_mcp_work" not in sent
+    assert len(sent) < len(full) / 4
+
+    record = result.tool_calls[0]
+    assert record.result == full
+    assert record.to_dict()["result"] == full
+    # `to_dict` is what reaches the session log and the UI, so the projection must not
+    # appear there under any key - a reader reconstructing the turn needs the real output.
+    assert "model_result" not in record.to_dict()
+
+    logged = [t for t in session.to_dict()["turns"] if t["role"] == "tool"]
+    assert logged[0]["text"] == full
+
+
+def test_the_projection_reaches_the_model_in_prompted_mode_too(session):
+    """Both modes converge on `_execute_tool`, so neither can be the one that leaks bulk."""
+    client = FakeClient(
+        [
+            prompted({"type": "tool_call", "name": "read_netlist", "arguments": {"path": "c.asc"}}),
+            prompted({"type": "answer", "text": "R1's pin is dangling on NC_01."}),
+        ]
+    )
+    full = full_netlist_json()
+    history: list[dict] = []
+
+    run_prompted(
+        client,
+        session,
+        "why is there no gain",
+        tool_executor=lambda name, arguments: full,
+        history=history,
+        compactor=compact_tool_result,
+    )
+
+    result_message = history[2]["content"]
+    assert result_message.startswith("TOOL RESULT")
+    assert "R1 Vout NC_01 10k" in result_message
+    assert "netlist_path" not in result_message
+
+
+def test_no_compactor_means_the_full_result_goes_to_the_model(session):
+    """The default, and what every other test in this file relies on.
+
+    Compaction is the caller's decision; the loop must not acquire an opinion of its own.
+    """
+    client = FakeClient(
+        [
+            wants_tools("", [("read_netlist", {"path": "c.asc"})]),
+            answer("done"),
+        ]
+    )
+    full = full_netlist_json()
+    history: list[dict] = []
+
+    run_agent_turn(
+        client,
+        session,
+        "q",
+        tools=[{"name": "read_netlist", "description": "", "input_schema": {}}],
+        tool_executor=lambda name, arguments: full,
+        history=history,
+    )
+
+    assert tool_results(history[2])[0]["content"] == full
+
+
+def test_a_declining_compactor_sends_the_result_unchanged(session):
+    """`None` is the fail-open answer, and it has to survive the plumbing.
+
+    An error result - the approval gate's REFUSED prose, for instance - travels this path,
+    and it is often the actual diagnosis.
+    """
+    client = FakeClient(
+        [
+            wants_tools("", [("patch_component_value", {"asc_path": "c.asc"})]),
+            answer("Here is the diff."),
+        ]
+    )
+    refusal = "REFUSED: writing to the schematic needs the user's approval first."
+    history: list[dict] = []
+
+    run_agent_turn(
+        client,
+        session,
+        "fix it",
+        tools=[{"name": "patch_component_value", "description": "", "input_schema": {}}],
+        tool_executor=lambda name, arguments: refusal,
+        history=history,
+        compactor=compact_tool_result,
+    )
+
+    assert tool_results(history[2])[0]["content"] == refusal
+
+
+def test_token_accounting_still_sums_across_rounds_with_compaction_active(session):
+    """The metric the whole experiment is judged on must not be the thing it breaks."""
+    client = FakeClient(
+        [
+            wants_tools("", [("read_netlist", {"path": "c.asc"})], input_tokens=900, output_tokens=40),
+            wants_tools("", [("run_simulation", {"path": "c.asc"})], input_tokens=700, output_tokens=30),
+            answer("It solves now.", input_tokens=800, output_tokens=120),
+        ]
+    )
+    full = full_netlist_json()
+
+    result = run_agent_turn(
+        client,
+        session,
+        "check it",
+        tools=[
+            {"name": "read_netlist", "description": "", "input_schema": {}},
+            {"name": "run_simulation", "description": "", "input_schema": {}},
+        ],
+        tool_executor=lambda name, arguments: full,
+        history=[],
+        compactor=compact_tool_result,
+    )
+
+    assert result.rounds == 3
+    assert (result.input_tokens, result.output_tokens) == (2400, 190)
+    data = session.to_dict()
+    assert data["total_input_tokens"] == 2400
+    assert data["total_output_tokens"] == 190
+    assert data["total_input_tokens"] == sum(t["input_tokens"] for t in data["turns"])
+    assert data["total_output_tokens"] == sum(t["output_tokens"] for t in data["turns"])
+
+
 # --- what the model is told when a circuit is selected ----------------------------------
 
 
@@ -1304,7 +1724,14 @@ def test_the_selection_note_carries_the_findings_not_just_a_count(api, tmp_path)
     assert "warning/single_connection_net" in note
     assert "[C1, vout]" in note
     # And an instruction not to repeat the check it has just been handed.
-    assert "not run it again" in note
+    assert "do not call these again" in note
+    assert "check_netlist_static" in note
+    # This stand-in answers *every* tool name with the static payload, so the topology
+    # preload gets a StaticCheckResult where a Netlist should be. `circuit_summary` fails
+    # closed on that - and the note must then say the topology is missing rather than claim
+    # a read that did not happen.
+    assert "topology was NOT read" in note
+    assert "Components:" not in note
     # UI-only metadata stays out of the context.
     assert "shadowed" not in note and "source_path" not in note
     # Whatever the model is told, the UI still gets the whole result.
@@ -1326,6 +1753,182 @@ def test_a_long_finding_list_is_capped_in_the_model_context(tmp_path):
     assert "and 3 more" in note
 
 
+# --- the preloaded topology, and the round it removes ------------------------------------
+#
+# The baseline spent a whole extra inference round on `read_netlist`, and that was not the
+# model being wasteful: the static *findings* were in context but the components were not,
+# so it had no way to name the fix. These tests cover both halves of the fix - the topology
+# being there, and the note telling the truth about whether it is.
+
+
+class PreloadingMCP:
+    """A server stand-in that answers both preload tools with real captured RCLP output."""
+
+    def __init__(self):
+        self.calls: list[tuple[str, dict]] = []
+
+    def call_tool(self, name, arguments, timeout=300.0):
+        from tests.test_compact import RCLP_NETLIST, RCLP_STATIC
+
+        self.calls.append((name, arguments))
+        if name == "check_netlist_static":
+            return json.dumps(RCLP_STATIC, indent=2)
+        if name == "read_netlist":
+            return json.dumps(RCLP_NETLIST, indent=2)
+        raise AssertionError(f"the test did not expect a {name} call")
+
+
+class NoTopologyMCP:
+    """A server whose *preload* read fails, the way an ExpressPCB `.net` really does.
+
+    The preload is the call carrying `include_raw_text=False`; a call the model makes itself
+    does not, which is how this stand-in tells the two apart. So the selection note is
+    honest about having no topology, and the tool remains available when the model asks.
+    """
+
+    def __init__(self):
+        self.calls: list[tuple[str, dict]] = []
+
+    def call_tool(self, name, arguments, timeout=300.0):
+        from tests.test_compact import RCLP_NETLIST
+
+        self.calls.append((name, arguments))
+        if name == "check_netlist_static":
+            return json.dumps({"summary": "Static checks clean.", "findings": [], "ok": True})
+        if name == "read_netlist":
+            if arguments.get("include_raw_text") is False:
+                raise MCPClientError("Tool read_netlist failed: not a SPICE netlist.")
+            return json.dumps(RCLP_NETLIST, indent=2)
+        raise AssertionError(f"the test did not expect a {name} call")
+
+
+def _select(api, tmp_path, mcp):
+    api._mcp = mcp
+    circuit = tmp_path / "RCLP.asc"
+    circuit.write_text("Version 4.1\n", encoding="utf-8")
+    result = api.select_circuit(str(circuit))
+    assert result["ok"], result.get("error")
+    return circuit
+
+
+def test_selection_preloads_the_topology_and_says_which_tools_ran(api, tmp_path):
+    """Selection runs both read tools once, and the note names exactly those two."""
+    mcp = PreloadingMCP()
+    _select(api, tmp_path, mcp)
+
+    assert [name for name, _ in mcp.calls] == ["check_netlist_static", "read_netlist"]
+    # The projection drops `raw_text`, so asking the server for it would be pure overhead.
+    assert mcp.calls[1][1]["include_raw_text"] is False
+
+    note = api._history[-1]["content"]
+    assert "check_netlist_static" in note and "read_netlist" in note
+    assert "do not call these again unless the file changes" in note
+    assert "topology was NOT read" not in note
+    # Findings *and* topology. Either one alone leaves the model a reason to spend a round.
+    assert "floating_pin" in note and "NC_01" in note
+    assert "R1 Vout NC_01 10k" in note
+    assert "NC_01: R1" in note
+    assert ".ac dec 10 1k 100k" in note
+    # The projection, not the payload: no staging paths, no duplicate netlist text.
+    assert "spice_mcp_work" not in note
+    assert "Generated by LTspice" not in note
+
+
+def test_a_preloaded_fault_can_be_answered_without_a_single_tool_call(api, tmp_path):
+    """The round the experiment is trying to remove, removed.
+
+    **Honest limit:** this proves the loop *can* finish in one round and that the context
+    holds everything needed to. It cannot prove the live model will choose to - only the A/B
+    run shows that. What it does pin is that a one-round answer is reachable, so a future
+    change that puts the topology back out of context fails here rather than only on the
+    bench.
+    """
+    mcp = PreloadingMCP()
+    _select(api, tmp_path, mcp)
+    api._tools = PROMPTED_TOOLS
+    api._client = FakeClient(
+        [
+            answer(
+                "Your input is disconnected. R1's left pin is floating on NC_01, so Vin "
+                "never reaches the filter. Wire that pin to Vin and re-run."
+            )
+        ]
+    )
+
+    out = api.send_message("why is my circuit not getting any gain")
+
+    assert out["ok"], out.get("error")
+    assert out["tool_calls"] == []
+    assert len(api._client.calls) == 1, "a second inference round means a tool was called"
+    # Only the two preload calls; nothing the model asked for.
+    assert len(mcp.calls) == 2
+    # And the evidence really was in front of it.
+    sent = json.dumps(api._client.calls[0]["messages"])
+    assert "NC_01" in sent and "10k" in sent
+
+
+@pytest.mark.parametrize("mode", [TOOL_MODE_NATIVE, TOOL_MODE_PROMPTED_JSON])
+def test_the_model_can_still_read_the_netlist_when_the_preload_failed(api, tmp_path, mode):
+    """The other direction, and the more important one.
+
+    A prompt that discourages redundant calls plus a note that wrongly claims the topology
+    is loaded would leave the model answering from nothing. So when the preload fails the
+    tool has to stay reachable, and its result has to come back - in both tool modes.
+    """
+    api._config = replace(api._config, tool_mode=mode)
+    mcp = NoTopologyMCP()
+    circuit = _select(api, tmp_path, mcp)
+    api._tools = PROMPTED_TOOLS
+
+    note = api._history[-1]["content"]
+    assert "topology was NOT read" in note
+    assert "read_netlist" in note
+    assert "Components:" not in note, "the note claimed a read that failed"
+
+    read_args = {"path": str(circuit)}
+    if mode == TOOL_MODE_NATIVE:
+        responses = [
+            wants_tools(None, [("read_netlist", read_args)]),
+            answer("R1's left pin sits on NC_01."),
+        ]
+    else:
+        responses = [
+            prompted({"type": "tool_call", "name": "read_netlist", "arguments": read_args}),
+            prompted({"type": "answer", "text": "R1's left pin sits on NC_01."}),
+        ]
+    api._client = FakeClient(responses)
+
+    out = api.send_message("why is my circuit not getting any gain")
+
+    assert out["ok"], out.get("error")
+    assert [c["name"] for c in out["tool_calls"]] == ["read_netlist"]
+    assert ("read_netlist", read_args) in mcp.calls
+    # The record keeps the full payload even though the model saw the projection.
+    assert "netlist_path" in out["tool_calls"][0]["result"]
+    assert out["text"] == "R1's left pin sits on NC_01."
+
+
+def test_applying_a_fix_marks_the_preloaded_context_stale(api, tmp_path):
+    """The counterweight to "do not call these again".
+
+    Once the file is written, the preloaded check and topology describe the *old* circuit.
+    Without saying so, the same instruction that saves a round before the fix would suppress
+    the re-simulation that confirms it.
+    """
+    from tests.conftest import FakeMCP
+
+    mcp = PreloadingMCP()
+    circuit = _select(api, tmp_path, mcp)
+    api._mcp = FakeMCP()
+
+    approved = api.apply_patch(str(circuit), "C1", "100n")
+    assert approved["ok"], approved.get("error")
+
+    note = api._history[-1]["content"]
+    assert "stale" in note
+    assert "re-read" in note
+
+
 def test_missing_credentials_is_reported_not_raised(tmp_path):
     """A missing token must surface in the UI banner, not crash the window on open.
 
@@ -1339,3 +1942,96 @@ def test_missing_credentials_is_reported_not_raised(tmp_path):
     assert "TAMU_API_KEY" in started["error"]
     # The banner has to say where to put it, or it is not actionable.
     assert ".env" in started["error"]
+
+
+# --- effort threading through run_agent_turn -----------------------------------------
+#
+# The per-request effort override must travel from run_agent_turn to GatewayClient.complete
+# in both modes, and the FakeClient now records it. This is additive: existing effort tests
+# in the GatewayClient section test the output_config parameter; these test the plumbing.
+
+
+@pytest.mark.parametrize("effort_value", [None, "low", "medium", "high"])
+def test_effort_threads_from_run_agent_turn_to_complete_native(session, effort_value):
+    client = FakeClient([answer("Done.")])
+
+    run_agent_turn(
+        client, session, "diagnose this",
+        tools=[{"name": "x"}],
+        effort=effort_value,
+        tool_mode=TOOL_MODE_NATIVE,
+    )
+
+    assert client.calls[0]["effort"] == effort_value
+
+
+@pytest.mark.parametrize("effort_value", [None, "low", "medium", "high"])
+def test_effort_threads_from_run_agent_turn_to_complete_prompted(session, effort_value):
+    client = FakeClient([prompted({"type": "answer", "text": "Done."})])
+
+    run_agent_turn(
+        client, session, "diagnose this",
+        tools=PROMPTED_TOOLS,
+        effort=effort_value,
+        tool_mode=TOOL_MODE_PROMPTED_JSON,
+    )
+
+    assert client.calls[0]["effort"] == effort_value
+
+
+# --- zero-tools prompted mode --------------------------------------------------------
+#
+# When tools=[] the prompted path must return plain text without JSON parsing or stop
+# sequences. The only cost should be the system prompt — no protocol header.
+
+
+def test_zero_tools_prompted_mode_returns_plain_text(session):
+    plain_answer = "The issue is R1 is disconnected."
+    client = FakeClient([
+        type("FakeResponse", (), {
+            "content": [type("TextBlock", (), {"type": "text", "text": plain_answer})()],
+            "stop_reason": "end_turn",
+            "usage": Usage(input_tokens=100, output_tokens=20),
+        })()
+    ])
+
+    result = run_agent_turn(
+        client, session, "why no gain",
+        tools=[],
+        tool_mode=TOOL_MODE_PROMPTED_JSON,
+    )
+
+    assert result.text == plain_answer
+    assert result.rounds == 1
+    assert result.tool_calls == []
+
+
+def test_zero_tools_prompted_mode_skips_protocol_header_in_system(session):
+    """When no tools are offered, the system prompt must not carry the protocol header."""
+    from spice_mcp_app.llm import PROMPTED_PROTOCOL_HEADER, SYSTEM_PROMPT
+
+    client = FakeClient([prompted({"type": "answer", "text": "All good."})])
+
+    run_agent_turn(
+        client, session, "diagnose this",
+        tools=[],
+        tool_mode=TOOL_MODE_PROMPTED_JSON,
+    )
+
+    system_sent = client.calls[0]["system"]
+    assert system_sent == SYSTEM_PROMPT
+    assert PROMPTED_PROTOCOL_HEADER[:30] not in system_sent
+
+
+def test_zero_tools_prompted_mode_no_stop_sequence(session):
+    """No stop sequences are needed when there is nothing to call."""
+    client = FakeClient([prompted({"type": "answer", "text": "All good."})])
+
+    run_agent_turn(
+        client, session, "diagnose this",
+        tools=[],
+        tool_mode=TOOL_MODE_PROMPTED_JSON,
+    )
+
+    stop_sent = client.calls[0].get("stop_sequences")
+    assert not stop_sent
